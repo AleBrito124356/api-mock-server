@@ -1,0 +1,6 @@
+{
+  "status": "ok",
+  "service": "shop-api-mock",
+  "time": "{{ now.iso }}",
+  "uptime_check_id": "{{ uuid }}"
+}
