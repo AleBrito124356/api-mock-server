@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Pattern, Tuple
+from typing import Any, Dict, List, Optional, Pattern, Tuple, Union
 
 import yaml
 
@@ -49,9 +49,13 @@ def compile_path(path: str) -> Tuple[Pattern[str], List[str]]:
 
 @dataclass
 class ResponseSpec:
-    """A single response template for an explicit route."""
+    """A single response template for an explicit route.
 
-    status: int = 200
+    ``status`` is normally an int, but may be a template string such as
+    ``"{{ request.query.status | default(200) }}"`` rendered per request.
+    """
+
+    status: Union[int, str] = 200
     headers: Dict[str, Any] = field(default_factory=dict)
     body: Any = None
     file: Optional[str] = None
@@ -71,6 +75,18 @@ class RouteSpec:
     regex: Pattern[str]
     param_names: List[str]
     order: int = 0
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+    @property
+    def label(self) -> str:
+        """Human-readable identity: the name, or ``METHOD /path``."""
+        return self.name or f"{self.method} {self.path}"
+
+    @property
+    def key(self) -> str:
+        """Stable identity for per-route state (rate-limit buckets, cursors)."""
+        return self.name or f"{self.method} {self.path} #{self.order}"
 
 
 @dataclass
@@ -95,6 +111,7 @@ class MockConfig:
     resources: List[ResourceSpec] = field(default_factory=list)
     record: Optional[Dict[str, Any]] = None
     base_dir: str = "."
+    source_path: Optional[str] = None
 
     @property
     def seed(self) -> Optional[int]:
@@ -118,13 +135,8 @@ def _build_route(raw: Dict[str, Any], order: int) -> RouteSpec:
     path = str(raw.get("path", "/"))
     regex, names = compile_path(path)
 
-    resp_raw = raw.get("response") or {}
-    response = ResponseSpec(
-        status=int(resp_raw.get("status", 200)),
-        headers=dict(resp_raw.get("headers") or {}),
-        body=resp_raw.get("body"),
-        file=resp_raw.get("file"),
-    )
+    response = _build_response(raw.get("response") or {})
+    name = raw.get("name")
     return RouteSpec(
         method=method,
         path=path,
@@ -136,6 +148,20 @@ def _build_route(raw: Dict[str, Any], order: int) -> RouteSpec:
         regex=regex,
         param_names=names,
         order=order,
+        name=str(name) if name is not None else None,
+        description=raw.get("description"),
+    )
+
+
+def _build_response(resp_raw: Dict[str, Any]) -> ResponseSpec:
+    status: Union[int, str] = resp_raw.get("status", 200)
+    if not (isinstance(status, str) and "{{" in status):
+        status = int(status)
+    return ResponseSpec(
+        status=status,
+        headers=dict(resp_raw.get("headers") or {}),
+        body=resp_raw.get("body"),
+        file=resp_raw.get("file"),
     )
 
 
@@ -172,4 +198,6 @@ def load_config(path: str) -> MockConfig:
     with open(path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     base_dir = os.path.dirname(os.path.abspath(path))
-    return build_config(data, base_dir=base_dir)
+    config = build_config(data, base_dir=base_dir)
+    config.source_path = os.path.abspath(path)
+    return config

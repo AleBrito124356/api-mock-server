@@ -17,26 +17,56 @@ Supported roots:
     uuid                    a random uuid4 string
     env.<VAR>               an environment variable
 
+Literals are allowed too: ``{{ 'text' }}``, ``{{ 42 }}``, ``{{ true }}``,
+``{{ null }}``.
+
 Filters are chained with ``|``: ``{{ request.query.page | default(1) | int }}``.
 
 If a value is *exactly* one ``{{ expr }}`` its native type is preserved
-(so ``{{ faker.int(1, 5) }}`` yields a JSON number, not a string). Embedded
-expressions are stringified.
+(so ``{{ faker.int(1, 5) }}`` yields a JSON number, not a string). A string
+with text around the token, or with several tokens, is interpolated into a
+string: ``"{{ faker.first_name }} {{ faker.last_name }}"``.
+
+A broken expression (an unknown faker helper or filter, or arguments of the
+wrong type) raises :class:`TemplateError`, which the server turns into a JSON
+500 that names the expression, instead of silently rendering ``null``.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 import time
 import uuid as _uuid
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from random import Random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _TOKEN = re.compile(r"\{\{\s*(.*?)\s*\}\}", re.S)
-_FULL = re.compile(r"^\{\{\s*(.*?)\s*\}\}$", re.S)
 _ATOM = re.compile(r"^([A-Za-z_][\w]*(?:\.[A-Za-z_][\w-]*)*)\s*(?:\((.*)\))?\s*$", re.S)
+_FILTER = re.compile(r"^([A-Za-z_]\w*)\s*(?:\((.*)\))?$", re.S)
+
+#: Roots an expression may start with (besides literals).
+KNOWN_ROOTS = ("request", "faker", "seq", "now", "uuid", "env")
+#: Identifiers that are parsed as literals rather than roots.
+LITERAL_WORDS = ("true", "false", "null", "none")
+#: ``request.<scope>`` names.
+REQUEST_SCOPES = ("method", "query", "path", "header", "headers", "body", "json")
+#: ``now.<part>`` names.
+NOW_PARTS = ("iso", "timestamp", "date", "time", "year", "month", "day")
+#: Filters usable after ``|``.
+KNOWN_FILTERS = ("default", "upper", "lower", "title", "int", "float", "round", "json")
+
+
+class TemplateError(ValueError):
+    """A ``{{ ... }}`` expression could not be evaluated."""
+
+    def __init__(self, message: str, expression: Optional[str] = None) -> None:
+        self.expression = expression
+        detail = f"{message} (in '{{{{ {expression} }}}}')" if expression else message
+        super().__init__(detail)
 
 
 class MockFaker:
@@ -86,7 +116,8 @@ class MockFaker:
         return f"{self.first_name().lower()}.{self.last_name().lower()}@{self.rng.choice(self._DOMAINS)}"
 
     def uuid(self) -> str:
-        return str(_uuid.UUID(int=self.rng.getrandbits(128)))
+        # version=4 sets the version/variant bits so the value is a valid uuid4.
+        return str(_uuid.UUID(int=self.rng.getrandbits(128), version=4))
 
     def int(self, lo: int = 0, hi: int = 100) -> int:
         return self.rng.randint(int(lo), int(hi))
@@ -99,6 +130,11 @@ class MockFaker:
 
     def bool(self) -> bool:
         return self.rng.random() < 0.5
+
+    def choice(self, *options: Any) -> Any:
+        if not options:
+            raise ValueError("faker.choice needs at least one option")
+        return self.rng.choice(list(options))
 
     def word(self) -> str:
         return self.rng.choice(self._WORDS)
@@ -134,6 +170,12 @@ class MockFaker:
     def slug(self) -> str:
         return f"{self.word()}-{self.word()}-{self.rng.randint(100, 999)}"
 
+    def url(self) -> str:
+        return f"https://{self.rng.choice(self._DOMAINS)}/{self.slug()}"
+
+    def ipv4(self) -> str:
+        return "192.0.2.%d" % self.rng.randint(1, 254)
+
     def _rand_date(self, lo_days: int, hi_days: int) -> date:
         offset = self.rng.randint(int(lo_days), int(hi_days))
         return date.today() + timedelta(days=offset)
@@ -153,12 +195,26 @@ class MockFaker:
         return (datetime(d.year, d.month, d.day) + t).isoformat() + "Z"
 
 
+def faker_helpers() -> List[str]:
+    """Public helper names callable as ``faker.<name>``."""
+    return sorted(
+        name for name, member in inspect.getmembers(MockFaker, inspect.isfunction)
+        if not name.startswith("_")
+    )
+
+
 class TemplateEngine:
     """Holds faker state and named sequences for the life of the server."""
 
     def __init__(self, seed: Optional[int] = None) -> None:
+        self.seed = seed
         self.faker = MockFaker(Random(seed))
         self.sequences: Dict[str, int] = {}
+
+    def reset(self) -> None:
+        """Rewind the RNG to its seed and clear every sequence counter."""
+        self.faker = MockFaker(Random(self.seed))
+        self.sequences = {}
 
     def next_seq(self, name: str, start: int = 1, step: int = 1) -> int:
         if name not in self.sequences:
@@ -172,7 +228,7 @@ class TemplateEngine:
 
 
 # --------------------------------------------------------------------------- #
-# Expression parsing / evaluation
+# Expression parsing
 # --------------------------------------------------------------------------- #
 
 def _split_top(text: str, sep: str) -> List[str]:
@@ -236,6 +292,74 @@ def _parse_args(arg_str: Optional[str]) -> List[Any]:
     return [_parse_literal(part) for part in _split_top(arg_str, ",")]
 
 
+@dataclass
+class ParsedExpression:
+    """The structure of one ``{{ ... }}`` expression.
+
+    ``kind`` is ``"ref"`` for ``root.a.b(args)`` references and ``"literal"``
+    for quoted strings, numbers and ``true``/``false``/``null``. Unknown bare
+    identifiers still evaluate to their own text (backwards compatible), but
+    ``mockserver validate`` reports them because they are nearly always typos.
+    """
+
+    source: str
+    kind: str
+    root: Optional[str] = None
+    rest: List[str] = field(default_factory=list)
+    args: List[Any] = field(default_factory=list)
+    has_call: bool = False
+    literal: Any = None
+    filters: List[Tuple[str, List[Any]]] = field(default_factory=list)
+    bad_filters: List[str] = field(default_factory=list)
+
+
+def parse_expression(expr: str) -> ParsedExpression:
+    """Parse an expression (the text between ``{{`` and ``}}``)."""
+    parts = _split_top(expr, "|")
+    head = parts[0].strip()
+    parsed: ParsedExpression
+    match = _ATOM.match(head)
+    if match and match.group(1).split(".")[0].lower() not in LITERAL_WORDS:
+        segs = match.group(1).split(".")
+        arg_str = match.group(2)
+        parsed = ParsedExpression(
+            source=expr,
+            kind="ref",
+            root=segs[0],
+            rest=segs[1:],
+            args=_parse_args(arg_str) if arg_str is not None else [],
+            has_call=arg_str is not None,
+        )
+    else:
+        parsed = ParsedExpression(source=expr, kind="literal", literal=_parse_literal(head))
+    for raw in parts[1:]:
+        fm = _FILTER.match(raw.strip())
+        if not fm:
+            parsed.bad_filters.append(raw.strip())
+            continue
+        f_args = _parse_args(fm.group(2)) if fm.group(2) is not None else []
+        parsed.filters.append((fm.group(1), f_args))
+    return parsed
+
+
+def find_expressions(text: str) -> List[str]:
+    """Return the inner text of every ``{{ ... }}`` token in ``text``."""
+    return [m.group(1).strip() for m in _TOKEN.finditer(text)]
+
+
+def single_expression(text: str) -> Optional[str]:
+    """If ``text`` is exactly one token (ignoring outer whitespace), return it."""
+    stripped = text.strip()
+    tokens = list(_TOKEN.finditer(stripped))
+    if len(tokens) == 1 and tokens[0].span() == (0, len(stripped)):
+        return tokens[0].group(1).strip()
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Evaluation
+# --------------------------------------------------------------------------- #
+
 def _resolve_request(rest: List[str], req: Dict[str, Any]) -> Any:
     if not rest:
         return None
@@ -266,22 +390,29 @@ def _resolve_request(rest: List[str], req: Dict[str, Any]) -> Any:
     return None
 
 
-def _resolve_faker(rest: List[str], args: List[Any], engine: TemplateEngine) -> Any:
-    if not rest:
-        return None
-    method = getattr(engine.faker, rest[0], None)
+def _resolve_faker(parsed: ParsedExpression, engine: TemplateEngine) -> Any:
+    if not parsed.rest:
+        raise TemplateError("'faker' needs a helper name, e.g. faker.name", parsed.source)
+    name = parsed.rest[0]
+    method = getattr(engine.faker, name, None) if not name.startswith("_") else None
     if method is None or not callable(method):
-        return None
-    return method(*args)
+        raise TemplateError(f"unknown faker helper '{name}'", parsed.source)
+    try:
+        return method(*parsed.args)
+    except (TypeError, ValueError) as exc:
+        raise TemplateError(f"faker.{name}{tuple(parsed.args)!r} failed: {exc}", parsed.source) from exc
 
 
-def _resolve_seq(rest: List[str], args: List[Any], engine: TemplateEngine) -> Any:
-    if not rest:
-        return None
-    name = rest[0]
-    start = args[0] if len(args) >= 1 else 1
-    step = args[1] if len(args) >= 2 else 1
-    return engine.next_seq(name, int(start), int(step))
+def _resolve_seq(parsed: ParsedExpression, engine: TemplateEngine) -> Any:
+    if not parsed.rest:
+        raise TemplateError("'seq' needs a counter name, e.g. seq.order", parsed.source)
+    args = parsed.args
+    try:
+        start = int(args[0]) if len(args) >= 1 else 1
+        step = int(args[1]) if len(args) >= 2 else 1
+    except (TypeError, ValueError) as exc:
+        raise TemplateError(f"seq arguments must be integers, got {tuple(args)!r}", parsed.source) from exc
+    return engine.next_seq(parsed.rest[0], start, step)
 
 
 def _resolve_now(rest: List[str], args: List[Any]) -> Any:
@@ -308,40 +439,29 @@ def _resolve_now(rest: List[str], args: List[Any]) -> Any:
     return now.isoformat(timespec="seconds")
 
 
-def _eval_atom(expr: str, req: Dict[str, Any], engine: TemplateEngine) -> Any:
-    match = _ATOM.match(expr)
-    if not match:
-        return _parse_literal(expr)
-    path = match.group(1)
-    arg_str = match.group(2)
-    args = _parse_args(arg_str) if arg_str is not None else []
-    segs = path.split(".")
-    root, rest = segs[0], segs[1:]
-
+def _eval_parsed(parsed: ParsedExpression, req: Dict[str, Any], engine: TemplateEngine) -> Any:
+    if parsed.kind == "literal":
+        return parsed.literal
+    root, rest = parsed.root, parsed.rest
     if root == "request":
         return _resolve_request(rest, req)
     if root == "faker":
-        return _resolve_faker(rest, args, engine)
+        return _resolve_faker(parsed, engine)
     if root == "seq":
-        return _resolve_seq(rest, args, engine)
+        return _resolve_seq(parsed, engine)
     if root == "now":
-        return _resolve_now(rest, args)
+        return _resolve_now(rest, parsed.args)
     if root == "uuid":
         return engine.faker.uuid()
     if root == "env":
-        key = rest[0] if rest else (str(args[0]) if args else "")
+        key = rest[0] if rest else (str(parsed.args[0]) if parsed.args else "")
         return os.environ.get(key)
-    # Not a known root: treat the whole thing as a literal.
-    return _parse_literal(path)
+    # Not a known root: keep the historical behaviour of treating the bare
+    # identifier as a literal string. `mockserver validate` flags these.
+    return ".".join([root or ""] + list(rest))
 
 
-def _apply_filter(value: Any, filter_expr: str) -> Any:
-    match = re.match(r"^([A-Za-z_]\w*)\s*(?:\((.*)\))?$", filter_expr.strip(), re.S)
-    if not match:
-        return value
-    name = match.group(1)
-    args = _parse_args(match.group(2)) if match.group(2) is not None else []
-
+def _apply_filter(value: Any, name: str, args: List[Any], source: str) -> Any:
     if name == "default":
         return value if value not in (None, "") else (args[0] if args else "")
     if name == "upper":
@@ -354,7 +474,10 @@ def _apply_filter(value: Any, filter_expr: str) -> Any:
         try:
             return int(value)
         except (TypeError, ValueError):
-            return value
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return value
     if name == "float":
         try:
             return float(value)
@@ -367,28 +490,31 @@ def _apply_filter(value: Any, filter_expr: str) -> Any:
             return value
     if name == "json":
         return json.dumps(value)
-    return value
+    raise TemplateError(f"unknown filter '{name}' (known: {', '.join(KNOWN_FILTERS)})", source)
 
 
 def evaluate(expr: str, req: Dict[str, Any], engine: TemplateEngine) -> Any:
-    parts = _split_top(expr, "|")
-    value = _eval_atom(parts[0].strip(), req, engine)
-    for f in parts[1:]:
-        value = _apply_filter(value, f)
+    parsed = parse_expression(expr)
+    if parsed.bad_filters:
+        raise TemplateError(f"cannot parse filter '{parsed.bad_filters[0]}'", expr)
+    value = _eval_parsed(parsed, req, engine)
+    for name, args in parsed.filters:
+        value = _apply_filter(value, name, args, expr)
     return value
 
 
 def render_string(text: str, req: Dict[str, Any], engine: TemplateEngine) -> Any:
-    stripped = text.strip()
-    full = _FULL.match(stripped)
-    if full:
+    single = single_expression(text)
+    if single is not None:
         # Whole string is a single expression: keep the native type.
-        return evaluate(full.group(1).strip(), req, engine)
+        return evaluate(single, req, engine)
 
     def repl(match: "re.Match[str]") -> str:
         value = evaluate(match.group(1).strip(), req, engine)
         if value is None:
             return ""
+        if isinstance(value, bool):
+            return "true" if value else "false"
         if isinstance(value, (dict, list)):
             return json.dumps(value)
         return str(value)

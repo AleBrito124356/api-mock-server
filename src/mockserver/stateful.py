@@ -15,10 +15,14 @@ and you get the full REST surface for free, backed by a dict:
     GET    /todos            list  (supports ?field=value, _limit, _offset,
                                     _sort, _order, _page, _per_page)
     GET    /todos/{id}       one   (404 if missing)
-    POST   /todos            create (auto-assigns the id, returns 201)
+    POST   /todos            create (auto-assigns the id, returns 201 +
+                                    Location; 409 if the body reuses an id)
     PUT    /todos/{id}       replace (404 if missing)
     PATCH  /todos/{id}       partial update (404 if missing)
     DELETE /todos/{id}       delete (204, or 404 if missing)
+    OPTIONS                  204 with an Allow header
+
+Write bodies must be JSON objects; anything else is a 400, never a crash.
 
 State lives in the process and resets on restart. Perfect for prototyping a
 frontend against a backend that does not exist yet.
@@ -34,6 +38,17 @@ from .config import ResourceSpec, compile_path
 
 # Query params that control listing rather than filter fields.
 _CONTROL = {"_limit", "_offset", "_sort", "_order", "_page", "_per_page", "_q"}
+
+_COLLECTION_ALLOW = "GET, HEAD, POST, OPTIONS"
+_ITEM_ALLOW = "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"
+
+
+class ResourceConflict(Exception):
+    """A create tried to reuse an id that already exists."""
+
+    def __init__(self, item_id: Any) -> None:
+        super().__init__(f"id {item_id!r} already exists")
+        self.item_id = item_id
 
 
 class ResourceStore:
@@ -120,10 +135,13 @@ class ResourceStore:
         return self._items.get(self._key(raw_id))
 
     def create(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert a new item. Raises :class:`ResourceConflict` on a duplicate id."""
         item = dict(data or {})
         if self.id_field not in item or item[self.id_field] in (None, ""):
             item[self.id_field] = self._next_id()
         else:
+            if self._key(item[self.id_field]) in self._items:
+                raise ResourceConflict(item[self.id_field])
             # Honor a client-supplied numeric id but keep the counter ahead.
             if self.id_type == "int":
                 try:
@@ -211,7 +229,9 @@ class ResourceRouter:
                     return {"spec": spec, "kind": "list"}
                 if method == "POST":
                     return {"spec": spec, "kind": "create"}
-                return {"spec": spec, "kind": "method_not_allowed", "allow": "GET, POST"}
+                if method == "OPTIONS":
+                    return {"spec": spec, "kind": "options", "allow": _COLLECTION_ALLOW}
+                return {"spec": spec, "kind": "method_not_allowed", "allow": _COLLECTION_ALLOW}
             m = item_re.match(path)
             if m:
                 raw_id = m.group("__rid__")
@@ -225,7 +245,9 @@ class ResourceRouter:
                     return {"spec": spec, "kind": "update", "id": item_id}
                 if method == "DELETE":
                     return {"spec": spec, "kind": "delete", "id": item_id}
-                return {"spec": spec, "kind": "method_not_allowed", "allow": "GET, PUT, PATCH, DELETE"}
+                if method == "OPTIONS":
+                    return {"spec": spec, "kind": "options", "allow": _ITEM_ALLOW}
+                return {"spec": spec, "kind": "method_not_allowed", "allow": _ITEM_ALLOW}
         return None
 
     def store_for(self, spec: ResourceSpec) -> ResourceStore:

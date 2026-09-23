@@ -114,3 +114,54 @@ async def test_uuid_ids():
         got = await client.get(f"/sessions/{sid}")
         assert got.status_code == 200
         assert got.json()["user"] == "ada"
+
+
+# --------------------------------------------------------------------------- #
+# Regressions: bad bodies are 400s, duplicate ids are 409s
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_array_body_is_400_not_500():
+    async with make_client(_app()) as client:
+        r = await client.post("/todos", json=[1, 2, 3])
+        assert r.status_code == 400
+        assert r.json()["error"] == "invalid_body"
+        assert "array" in r.json()["message"]
+        # The store is untouched.
+        assert (await client.get("/todos")).headers["x-total-count"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_is_400_for_every_write_method():
+    async with make_client(_app()) as client:
+        headers = {"content-type": "application/json"}
+        assert (await client.post("/todos", content=b"{nope", headers=headers)).status_code == 400
+        assert (await client.put("/todos/1", content=b"{nope", headers=headers)).status_code == 400
+        r = await client.patch("/todos/1", content=b'"just a string"', headers=headers)
+        assert r.status_code == 400 and r.json()["error"] == "invalid_body"
+
+
+@pytest.mark.asyncio
+async def test_post_with_existing_id_is_409_and_does_not_overwrite():
+    async with make_client(_app()) as client:
+        r = await client.post("/todos", json={"id": 1, "title": "OVERWRITTEN"})
+        assert r.status_code == 409
+        assert r.json()["error"] == "conflict"
+        assert (await client.get("/todos/1")).json()["title"] == "First"
+
+
+@pytest.mark.asyncio
+async def test_post_with_new_explicit_id_is_honoured():
+    async with make_client(_app()) as client:
+        r = await client.post("/todos", json={"id": 10, "title": "Ten"})
+        assert r.status_code == 201 and r.headers["location"] == "/todos/10"
+        nxt = await client.post("/todos", json={"title": "Eleven"})
+        assert nxt.json()["id"] == 11
+
+
+@pytest.mark.asyncio
+async def test_unsupported_method_is_405_with_allow():
+    async with make_client(_app()) as client:
+        r = await client.delete("/todos")
+        assert r.status_code == 405
+        assert "POST" in r.headers["allow"]
