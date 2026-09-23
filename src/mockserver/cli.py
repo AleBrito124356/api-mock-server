@@ -1,13 +1,17 @@
 """Command-line interface.
 
-    mockserver serve   [--config mocks.yaml] [--host] [--port] [--seed] [--fixtures DIR]
-    mockserver replay  [--fixtures DIR] [--config mocks.yaml] [--host] [--port] [--seed]
-    mockserver record  [--upstream URL] [--fixtures DIR] [--config] [--host] [--port] [--seed]
+    mockserver serve    [--config mocks.yaml] [--host] [--port] [--seed] [--fixtures DIR] [--watch]
+    mockserver replay   [--fixtures DIR] [--config mocks.yaml] [--host] [--port] [--seed]
+    mockserver record   [--upstream URL] [--fixtures DIR] [--config] [--host] [--port] [--seed]
+    mockserver validate FILE [FILE ...] [--strict] [--json]
     mockserver import-openapi <spec> [--out mocks.yaml]
     mockserver --version
 
-``serve``, ``replay`` and ``record`` boot the ASGI app with uvicorn.
-``import-openapi`` writes a mocks file from an OpenAPI document and exits.
+``serve``, ``replay`` and ``record`` validate the mocks file, then boot the
+ASGI app with uvicorn; they refuse to start on validation errors unless
+``--no-validate`` is given. ``validate`` only checks files (exit 1 on errors),
+which makes it a one-line CI step. ``import-openapi`` writes a mocks file from
+an OpenAPI document and exits.
 
 Defaults come from, highest priority first: the command-line flag, a real
 environment variable, a ``.env`` file in the current directory (or the one
@@ -23,6 +27,8 @@ given with ``--env-file``), then the built-in default. The variables are:
 from __future__ import annotations
 
 import argparse
+import json
+import logging
 import os
 import re
 import sys
@@ -32,6 +38,7 @@ from . import __version__
 from .config import MockConfig, build_config, load_config
 from .openapi_import import import_openapi_to_yaml
 from .server import INDEX_PATH, create_app
+from .validate import Problem, format_report, has_errors, validate_file
 
 ENV_VARS = ("MOCK_CONFIG", "MOCK_HOST", "MOCK_PORT", "MOCK_SEED", "MOCK_UPSTREAM", "MOCK_FIXTURES")
 DEFAULT_ENV_FILE = ".env"
@@ -149,9 +156,36 @@ def _run(app: Any, host: str, port: int) -> None:
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
-def _load_optional_config(path: Optional[str], explicit: bool) -> Optional[MockConfig]:
+def _configure_logging() -> None:
+    """Send mockserver's own log lines (reloads, mock errors) to stderr."""
+    log = logging.getLogger("mockserver")
+    if not log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:     [mockserver] %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(logging.INFO)
+        log.propagate = False
+
+
+def _check(path: str, skip: bool) -> bool:
+    """Validate before booting. Returns False when the server must not start."""
+    if skip:
+        return True
+    problems = validate_file(path)
+    if has_errors(problems):
+        sys.stderr.write(format_report(path, problems) + "\n")
+        sys.stderr.write("Refusing to start. Fix the errors above, or pass --no-validate to start anyway.\n")
+        return False
+    for problem in problems:
+        sys.stderr.write(f"{path}: {problem}\n")
+    return True
+
+
+def _load_optional_config(path: Optional[str], explicit: bool, skip_validation: bool = False) -> Optional[MockConfig]:
     """Load a config that may legitimately be absent (record/replay)."""
     if path and os.path.exists(path):
+        if not _check(path, skip_validation):
+            return None
         return load_config(path)
     if explicit and path:
         sys.stderr.write(f"Config file not found: {path}\n")
@@ -169,23 +203,27 @@ def _banner(action: str, source: str, config: MockConfig, host: str, port: int) 
 
 
 def _apply_seed(config: MockConfig, seed: Optional[int]) -> None:
-    if seed is not None:
-        config.settings["seed"] = seed
+    config.set_seed(seed)
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
     if not os.path.exists(args.config):
         sys.stderr.write(f"Config file not found: {args.config}\n")
         return 1
+    if not _check(args.config, args.no_validate):
+        return 1
     config = load_config(args.config)
     _apply_seed(config, args.seed)
     if args.fixtures:
         fixtures = os.path.abspath(args.fixtures)
-        config.record = {"upstream": None, "fixtures_dir": fixtures, "record": False}
-    app = create_app(config)
+        config.set_record({"upstream": None, "fixtures_dir": fixtures, "record": False})
+    _configure_logging()
+    app = create_app(config, watch=args.watch)
     _banner("serving", args.config, config, args.host, args.port)
     if args.fixtures:
         print(f"  unmatched requests replay fixtures from: {config.record['fixtures_dir']}", flush=True)
+    if args.watch:
+        print("  watching the mocks file and its body files: edits apply on the next request", flush=True)
     _run(app, args.host, args.port)
     return 0
 
@@ -199,11 +237,12 @@ def _cmd_replay(args: argparse.Namespace) -> int:
             f"--fixtures {args.fixtures}\n"
         )
         return 1
-    config = _load_optional_config(args.config, explicit=args.config_explicit)
+    config = _load_optional_config(args.config, explicit=args.config_explicit, skip_validation=args.no_validate)
     if config is None:
         return 1
     _apply_seed(config, args.seed)
-    config.record = {"upstream": None, "fixtures_dir": fixtures, "record": False}
+    config.set_record({"upstream": None, "fixtures_dir": fixtures, "record": False})
+    _configure_logging()
     app = create_app(config)
     recorder = app.state.mock_server.recorder
     _banner("replaying", fixtures, config, args.host, args.port)
@@ -220,17 +259,45 @@ def _cmd_record(args: argparse.Namespace) -> int:
             f"--fixtures {args.fixtures}\n"
         )
         return 2
-    config = _load_optional_config(args.config, explicit=args.config_explicit)
+    config = _load_optional_config(args.config, explicit=args.config_explicit, skip_validation=args.no_validate)
     if config is None:
         return 1
     _apply_seed(config, args.seed)
     fixtures = os.path.abspath(args.fixtures)
-    config.record = {"upstream": args.upstream, "fixtures_dir": fixtures, "record": True}
+    config.set_record({"upstream": args.upstream, "fixtures_dir": fixtures, "record": True})
+    _configure_logging()
     app = create_app(config)
     _banner("recording", args.upstream, config, args.host, args.port)
     print(f"  unmatched requests are proxied and saved to: {fixtures}", flush=True)
     _run(app, args.host, args.port)
     return 0
+
+
+def _summary(path: str) -> str:
+    try:
+        config = load_config(path)
+    except Exception:  # noqa: BLE001 - the summary is cosmetic
+        return ""
+    routes, resources = len(config.routes), len(config.resources)
+    return (f"{routes} route{'s' if routes != 1 else ''}, "
+            f"{resources} resource{'s' if resources != 1 else ''}")
+
+
+def _cmd_validate(args: argparse.Namespace) -> int:
+    failed = False
+    results: List[Dict[str, Any]] = []
+    for path in args.files:
+        problems: List[Problem] = validate_file(path)
+        bad = has_errors(problems) or (args.strict and bool(problems))
+        failed = failed or bad
+        if args.json:
+            results.append({"file": path, "ok": not bad, "problems": [p.to_dict() for p in problems]})
+        else:
+            summary = _summary(path) if not has_errors(problems) else ""
+            print(format_report(path, problems, summary))
+    if args.json:
+        print(json.dumps(results, indent=2))
+    return 1 if failed else 0
 
 
 def _cmd_import(args: argparse.Namespace) -> int:
@@ -273,6 +340,8 @@ def build_parser(env: Optional[EnvDefaults] = None) -> argparse.ArgumentParser:
         p.add_argument("--host", default=host, help=f"Bind host (MOCK_HOST, default {host}).")
         p.add_argument("--port", "-p", type=int, default=port, help=f"Bind port (MOCK_PORT, default {port}).")
         p.add_argument("--seed", type=int, default=seed, help="Override the chaos/faker seed (MOCK_SEED).")
+        p.add_argument("--no-validate", action="store_true",
+                       help="Start even if the mocks file has validation errors.")
 
     parser = argparse.ArgumentParser(
         prog="mockserver",
@@ -288,6 +357,8 @@ def build_parser(env: Optional[EnvDefaults] = None) -> argparse.ArgumentParser:
     add_bind(serve)
     serve.add_argument("--fixtures", default=None, metavar="DIR",
                        help="Also replay recorded fixtures from DIR for unmatched requests (offline).")
+    serve.add_argument("--watch", action="store_true",
+                       help="Reload the mocks file (and body files) when they change, without a restart.")
     serve.set_defaults(func=_cmd_serve)
 
     replay = sub.add_parser("replay", parents=[common],
@@ -309,6 +380,13 @@ def build_parser(env: Optional[EnvDefaults] = None) -> argparse.ArgumentParser:
                      help=f"Directory to store recorded fixtures (MOCK_FIXTURES, default {fixtures_default}).")
     add_bind(rec)
     rec.set_defaults(func=_cmd_record, config_explicit=False)
+
+    val = sub.add_parser("validate", parents=[common],
+                         help="Check mocks files for typos and invalid values (exit 1 on errors).")
+    val.add_argument("files", nargs="+", metavar="FILE", help="Mocks files to check.")
+    val.add_argument("--strict", action="store_true", help="Treat warnings as errors too.")
+    val.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    val.set_defaults(func=_cmd_validate)
 
     imp = sub.add_parser("import-openapi", parents=[common], help="Build a mocks file from an OpenAPI spec.")
     imp.add_argument("spec", help="Path to the OpenAPI 3 document (YAML or JSON).")

@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Starlette](https://img.shields.io/badge/ASGI-Starlette-ff69b4)
-![Tests](https://img.shields.io/badge/tests-104%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-155%20passing-brightgreen)
 
 ---
 
@@ -175,6 +175,37 @@ are hashed in canonical form, so key order and whitespace do not matter.
 Fixtures recorded by 0.1.x (no body hash) still replay. A replay miss is a 404
 naming the fixture key it looked for; an unreachable upstream is a 502
 `upstream_error`, not a hang or an opaque 500.
+
+### Validate and hot-reload
+
+A typo in a hand-edited YAML file should be an error, not a mock that quietly
+returns the wrong thing. `mockserver validate` checks keys at every level
+(with "did you mean" suggestions), methods, status codes, latency/chaos
+ranges, resource settings, that `response.file` exists and parses, and every
+`{{ }}` expression (roots, faker helpers and their arguments, filters, and
+path params the route actually captures):
+
+```text
+$ mockserver validate broken.yaml
+broken.yaml: 5 errors
+  error    config: unknown key 'sed' (did you mean 'seed'?)
+  error    routes[0]: unknown key 'respnse' (did you mean 'response'?)
+  error    routes[1].response.status: 700 is not a valid HTTP status (an integer 100-599)
+  error    routes[1].response.body.id: path param 'pid' (did you mean 'id'?) is not captured by this route ({id}) in '{{ request.path.pid | int }}'
+  error    routes[1].response.body.name: unknown faker helper 'nmae' (did you mean 'name'?) in '{{ faker.nmae }}'
+```
+
+It exits 1 on errors (`--strict` also fails on warnings, `--json` prints
+machine-readable output), so it is a one-line CI check for your mock files.
+`serve`, `replay` and `record` run the same validation first and refuse to
+start on errors; `--no-validate` starts anyway.
+
+`mockserver serve --watch` reloads the mocks file, and any `response.file`
+it references, when they change, so an edit shows up on the next request
+without a restart. Data in stateful resources survives the reload unless that
+resource's definition changed, and sequences keep counting. An invalid edit is
+rejected: the server logs the problems, keeps serving the last good version,
+and lists them under `watch.errors` in `GET /__mock__`.
 
 ## mocks.yaml reference
 

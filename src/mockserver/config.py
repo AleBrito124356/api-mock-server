@@ -78,6 +78,9 @@ class RouteSpec:
     name: Optional[str] = None
     description: Optional[str] = None
 
+    def all_responses(self) -> List[ResponseSpec]:
+        return [self.response]
+
     @property
     def label(self) -> str:
         """Human-readable identity: the name, or ``METHOD /path``."""
@@ -112,6 +115,38 @@ class MockConfig:
     record: Optional[Dict[str, Any]] = None
     base_dir: str = "."
     source_path: Optional[str] = None
+    # Values set from outside the file (CLI --seed / --fixtures). They are
+    # re-applied when --watch reloads the file so a reload never drops them.
+    overrides: Dict[str, Any] = field(default_factory=dict)
+
+    def set_seed(self, seed: Optional[int]) -> None:
+        """Override the file's seed (kept across hot reloads)."""
+        if seed is not None:
+            self.settings["seed"] = seed
+            self.overrides["seed"] = seed
+
+    def set_record(self, record: Optional[Dict[str, Any]]) -> None:
+        """Override the file's record block (kept across hot reloads)."""
+        self.record = record
+        self.overrides["record"] = record
+
+    def apply_overrides(self, overrides: Dict[str, Any]) -> None:
+        if "seed" in overrides:
+            self.set_seed(overrides["seed"])
+        if "record" in overrides:
+            self.set_record(overrides["record"])
+
+    def body_files(self) -> List[str]:
+        """Absolute paths of every ``response.file`` the routes reference."""
+        out: List[str] = []
+        for route in self.routes:
+            for response in route.all_responses():
+                if response.file:
+                    path = response.file
+                    if not os.path.isabs(path):
+                        path = os.path.join(self.base_dir, path)
+                    out.append(os.path.abspath(path))
+        return out
 
     @property
     def seed(self) -> Optional[int]:
@@ -193,8 +228,19 @@ def build_config(data: Optional[Dict[str, Any]], base_dir: str = ".") -> MockCon
     )
 
 
-def load_config(path: str) -> MockConfig:
-    """Load and parse a mocks YAML file from disk."""
+def load_config(path: str, strict: bool = False) -> MockConfig:
+    """Load and parse a mocks YAML file from disk.
+
+    With ``strict=True`` the file is validated first (see
+    :mod:`mockserver.validate`) and :class:`~mockserver.validate.ConfigError`
+    is raised if there are errors, instead of building a subtly wrong mock.
+    """
+    if strict:
+        from .validate import ConfigError, has_errors, validate_file
+
+        problems = validate_file(path)
+        if has_errors(problems):
+            raise ConfigError(path, problems)
     with open(path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     base_dir = os.path.dirname(os.path.abspath(path))

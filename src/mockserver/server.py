@@ -27,6 +27,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import anyio
@@ -37,7 +38,7 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from .behavior import BehaviorEngine
-from .config import MockConfig, ResourceSpec, ResponseSpec, RouteSpec
+from .config import MockConfig, ResourceSpec, ResponseSpec, RouteSpec, load_config
 from .dynamic import TemplateEngine, TemplateError
 from .record import build_recorder
 from .stateful import ResourceConflict, ResourceRouter
@@ -77,8 +78,10 @@ class Matcher:
         explicit_only: bool = False,
     ) -> Optional[Tuple[RouteSpec, Dict[str, str]]]:
         """First route that matches. ``explicit_only`` ignores ANY/* routes."""
-        effective = "GET" if method == "HEAD" else method
-        allowed = (effective,) if explicit_only else (effective, "ANY", "*")
+        # HEAD is answered by HEAD routes first, then by GET routes.
+        allowed: Tuple[str, ...] = (method, "GET") if method == "HEAD" else (method,)
+        if not explicit_only:
+            allowed += ("ANY", "*")
         for route in self.routes:
             if route.method not in allowed:
                 continue
@@ -158,6 +161,8 @@ class MockServer:
         config: MockConfig,
         *,
         upstream_transport: Optional[httpx.AsyncBaseTransport] = None,
+        watch: bool = False,
+        watch_interval: float = 0.5,
     ) -> None:
         self.config = config
         self.engine = TemplateEngine(seed=config.seed)
@@ -169,6 +174,95 @@ class MockServer:
             build_recorder(config.record, config.base_dir, transport=upstream_transport)
             if config.record else None
         )
+        # Hot reload (serve --watch): re-read the mocks file when it changes.
+        if watch and not config.source_path:
+            raise ValueError("watch=True needs a config loaded from a file (load_config)")
+        self.watch = watch
+        self.watch_interval = watch_interval
+        self.reload_count = 0
+        self.reload_errors: List[str] = []
+        self._watch_snapshot = self._snapshot() if watch else {}
+        self._last_watch_check = time.monotonic()
+
+    # -- hot reload ------------------------------------------------------- #
+    def _watched_files(self) -> List[str]:
+        files = [self.config.source_path] if self.config.source_path else []
+        return files + self.config.body_files()
+
+    def _snapshot(self) -> Dict[str, Optional[int]]:
+        snap: Dict[str, Optional[int]] = {}
+        for path in self._watched_files():
+            try:
+                snap[path] = os.stat(path).st_mtime_ns
+            except OSError:
+                snap[path] = None
+        return snap
+
+    async def maybe_reload(self) -> None:
+        """Reload the config if a watched file changed (throttled)."""
+        if not self.watch:
+            return
+        now = time.monotonic()
+        if now - self._last_watch_check < self.watch_interval:
+            return
+        self._last_watch_check = now
+        snapshot = self._snapshot()
+        if snapshot == self._watch_snapshot:
+            return
+        self._watch_snapshot = snapshot
+        await self.reload()
+
+    async def reload(self) -> bool:
+        """Re-read the mocks file. On errors keep serving the last good config."""
+        from .validate import has_errors, validate_file
+
+        path = self.config.source_path
+        if not path:
+            return False
+        problems = validate_file(path)
+        if has_errors(problems):
+            self.reload_errors = [str(p) for p in problems if p.level == "error"]
+            logger.error(
+                "reload of %s rejected, still serving the previous version:\n  %s",
+                path, "\n  ".join(self.reload_errors),
+            )
+            return False
+        try:
+            new_config = load_config(path)
+        except Exception as exc:  # noqa: BLE001 - keep serving on any load failure
+            self.reload_errors = [f"error    {type(exc).__name__}: {exc}"]
+            logger.error("reload of %s failed, still serving the previous version: %s", path, exc)
+            return False
+        new_config.apply_overrides(self.config.overrides)
+        await self._swap_config(new_config)
+        self.reload_errors = []
+        self.reload_count += 1
+        # Body files may have been added or removed: track the new set.
+        self._watch_snapshot = self._snapshot()
+        logger.info(
+            "reloaded %s: %d routes, %d resources (kept data for: %s)",
+            path, len(new_config.routes), len(new_config.resources),
+            ", ".join(self.resources.kept) or "none",
+        )
+        return True
+
+    async def _swap_config(self, new: MockConfig) -> None:
+        old_recorder = self.recorder
+        if new.seed != self.config.seed:
+            self.engine = TemplateEngine(seed=new.seed)
+            self.behavior = BehaviorEngine(seed=new.seed)
+        matcher = Matcher(new.routes)
+        resources = ResourceRouter(new.resources, previous=self.resources)
+        recorder = old_recorder
+        if new.record != self.config.record:
+            recorder = (
+                build_recorder(new.record, new.base_dir, transport=self._upstream_transport)
+                if new.record else None
+            )
+        # Swap everything in one synchronous step so no request sees a mix.
+        self.config, self.matcher, self.resources, self.recorder = new, matcher, resources, recorder
+        if old_recorder is not None and old_recorder is not recorder:
+            await old_recorder.aclose()
 
     # -- request context -------------------------------------------------- #
     async def _build_info(self, request: Request) -> Dict[str, Any]:
@@ -470,6 +564,11 @@ class MockServer:
                 "routes": routes,
                 "resources": resources,
                 "record": bool(self.recorder),
+                "watch": {
+                    "enabled": self.watch,
+                    "reloads": self.reload_count,
+                    "errors": self.reload_errors,
+                },
             },
             {},
         )
@@ -558,6 +657,7 @@ class MockServer:
         return self._make_response(500, body, {})
 
     async def dispatch(self, request: Request) -> Response:
+        await self.maybe_reload()
         info = await self._build_info(request)
         trace: Dict[str, Any] = {}
         try:
@@ -582,13 +682,23 @@ def create_app(
     config: MockConfig,
     *,
     upstream_transport: Optional[httpx.AsyncBaseTransport] = None,
+    watch: bool = False,
+    watch_interval: float = 0.5,
 ) -> Starlette:
     """Build a Starlette ASGI app that serves the given mock configuration.
 
     ``upstream_transport`` lets tests (or embedders) plug an httpx transport
     such as ``httpx.MockTransport`` into record mode instead of the network.
+
+    ``watch=True`` (config must come from :func:`load_config`) re-reads the
+    mocks file and its body files when they change, checked at most every
+    ``watch_interval`` seconds on incoming requests. Resource data survives a
+    reload unless that resource's definition changed; an invalid edit is
+    rejected and the last good config keeps serving.
     """
-    server = MockServer(config, upstream_transport=upstream_transport)
+    server = MockServer(
+        config, upstream_transport=upstream_transport, watch=watch, watch_interval=watch_interval
+    )
 
     async def catch_all(request: Request) -> Response:
         return await server.dispatch(request)

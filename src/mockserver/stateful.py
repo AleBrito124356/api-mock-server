@@ -209,14 +209,30 @@ def _sort_key(value: Any) -> Tuple[int, Any]:
     return (1, str(value))
 
 
-class ResourceRouter:
-    """Maps an incoming method+path to a resource operation."""
+def _data_identity(spec: ResourceSpec) -> Tuple[Any, ...]:
+    """What defines a store's data (latency/chaos changes keep the data)."""
+    return (spec.name, spec.path, spec.id_field, spec.id_type, repr(spec.seed))
 
-    def __init__(self, specs: List[ResourceSpec]) -> None:
+
+class ResourceRouter:
+    """Maps an incoming method+path to a resource operation.
+
+    Pass ``previous`` (the router being replaced on a hot reload) to keep the
+    in-memory data of every resource whose definition did not change.
+    """
+
+    def __init__(self, specs: List[ResourceSpec], previous: Optional["ResourceRouter"] = None) -> None:
         self.stores: Dict[str, ResourceStore] = {}
         self._entries: List[Tuple[ResourceSpec, "re.Pattern[str]", "re.Pattern[str]"]] = []
+        self.kept: List[str] = []
         for spec in specs:
-            self.stores[spec.name] = ResourceStore(spec)
+            old = previous.stores.get(spec.name) if previous is not None else None
+            if old is not None and _data_identity(old.spec) == _data_identity(spec):
+                old.spec = spec
+                self.stores[spec.name] = old
+                self.kept.append(spec.name)
+            else:
+                self.stores[spec.name] = ResourceStore(spec)
             coll_re, _ = compile_path(spec.path)
             item_re, _ = compile_path(spec.path.rstrip("/") + "/{__rid__}")
             self._entries.append((spec, coll_re, item_re))
