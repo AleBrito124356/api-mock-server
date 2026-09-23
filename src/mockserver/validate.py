@@ -51,8 +51,10 @@ from .dynamic import (
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "ANY", "*")
 
 TOP_KEYS = ("config", "routes", "resources", "record")
-CONFIG_KEYS = ("seed", "cors", "latency", "chaos")
-ROUTE_KEYS = ("name", "description", "method", "path", "priority", "match", "latency", "chaos", "response")
+CONFIG_KEYS = ("seed", "cors", "latency", "chaos", "admin_prefix", "journal_size")
+ROUTE_KEYS = ("name", "description", "method", "path", "priority", "match", "latency", "chaos",
+              "response", "responses", "sequence")
+SEQUENCE_MODES = ("stick", "cycle")
 RESPONSE_KEYS = ("status", "headers", "body", "file")
 MATCH_KEYS = ("query", "headers", "body")
 LATENCY_KEYS = ("fixed_ms", "random_ms", "min_ms", "max_ms")
@@ -117,6 +119,7 @@ def _is_template(value: Any) -> bool:
 class _Validator:
     def __init__(self, base_dir: str) -> None:
         self.base_dir = base_dir
+        self.admin_prefix = "/__mock__"
         self.problems: List[Problem] = []
         self._helpers = faker_helpers()
         self._probe = MockFaker(Random(0))
@@ -296,6 +299,15 @@ class _Validator:
             self.latency(cfg["latency"], f"{loc}.latency")
         if cfg.get("chaos") is not None:
             self.chaos(cfg["chaos"], f"{loc}.chaos", params=[])
+        prefix = cfg.get("admin_prefix")
+        if prefix is not None:
+            if not isinstance(prefix, str) or not prefix.startswith("/") or prefix.strip("/") == "":
+                self.error(f"{loc}.admin_prefix", f"must be a path like /__mock__ (not '/'), got {prefix!r}")
+            else:
+                self.admin_prefix = "/" + prefix.strip("/")
+        size = cfg.get("journal_size")
+        if size is not None and (not _is_int(size) or size < 0):
+            self.error(f"{loc}.journal_size", f"must be an integer >= 0 (0 disables the journal), got {size!r}")
 
     def latency(self, spec: Any, loc: str) -> None:
         if not self.mapping(spec, loc):
@@ -391,6 +403,10 @@ class _Validator:
                 params: Optional[List[str]] = []
             else:
                 params = self.path(route["path"], f"{loc}.path")
+                rpath = str(route["path"])
+                if rpath == self.admin_prefix or rpath.startswith(self.admin_prefix + "/"):
+                    self.warn(f"{loc}.path", f"is under the admin prefix {self.admin_prefix} and can never match "
+                                             "(set config.admin_prefix to move the admin API)")
             name = route.get("name")
             if name is not None:
                 if not isinstance(name, str) or not name.strip():
@@ -420,6 +436,23 @@ class _Validator:
                 seen[signature] = i
 
     def route_responses(self, route: Dict[str, Any], loc: str, params: Optional[Sequence[str]]) -> None:
+        if "sequence" in route:
+            mode = route["sequence"]
+            if mode not in SEQUENCE_MODES:
+                self.error(f"{loc}.sequence", f"must be one of {', '.join(SEQUENCE_MODES)}, got {mode!r}"
+                                              f"{_suggest(str(mode), SEQUENCE_MODES)}")
+            elif "responses" not in route:
+                self.warn(f"{loc}.sequence", "only applies to a 'responses' list")
+        if "responses" in route:
+            if "response" in route:
+                self.error(loc, "has both 'response' and 'responses'; use one")
+            items = route["responses"]
+            if not isinstance(items, list) or not items:
+                self.error(f"{loc}.responses", "must be a non-empty list of responses")
+                return
+            for j, item in enumerate(items):
+                self.response(item, f"{loc}.responses[{j}]", params)
+            return
         if "response" not in route:
             typo = difflib.get_close_matches("response", [str(k) for k in route], n=1, cutoff=0.6)
             if not typo:  # a misspelt 'response' key is already reported as an error

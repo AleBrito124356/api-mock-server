@@ -174,6 +174,9 @@ class ResourceStore:
     def delete(self, raw_id: Any) -> bool:
         return self._items.pop(self._key(raw_id), None) is not None
 
+    def __len__(self) -> int:
+        return len(self._items)
+
 
 def _field_equals(field_value: Any, query_value: Any) -> bool:
     """Compare a stored field against a query-string value.
@@ -268,3 +271,9 @@ class ResourceRouter:
 
     def store_for(self, spec: ResourceSpec) -> ResourceStore:
         return self.stores[spec.name]
+
+    def reset(self) -> List[str]:
+        """Put every resource back to its seed data. Returns the names."""
+        for name, store in list(self.stores.items()):
+            self.stores[name] = ResourceStore(store.spec)
+        return list(self.stores)

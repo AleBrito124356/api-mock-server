@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Starlette](https://img.shields.io/badge/ASGI-Starlette-ff69b4)
-![Tests](https://img.shields.io/badge/tests-155%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-170%20passing-brightgreen)
 
 ---
 
@@ -207,19 +207,73 @@ resource's definition changed, and sequences keep counting. An invalid edit is
 rejected: the server logs the problems, keeps serving the last good version,
 and lists them under `watch.errors` in `GET /__mock__`.
 
+### Use it from e2e tests: journal, reset, scripted responses
+
+The mock remembers what your frontend called, and can be put back to a known
+state between tests. Everything lives under `/__mock__` (move it with
+`config.admin_prefix`); admin calls are never journaled themselves.
+
+| Endpoint | What it does |
+|---|---|
+| `GET /__mock__` | index: routes, resources, record/watch/journal status, admin endpoints |
+| `GET /__mock__/routes` | routes in match order, with `hits` and the position of scripted responses |
+| `GET /__mock__/requests` | the request journal, oldest first. Filters: `?method=POST`, `?path=/todos/*` (glob), `?route=create-order`, `?status=201`, `?since=<id>`, `?limit=N` |
+| `DELETE /__mock__/requests` | clear the journal |
+| `POST /__mock__/reset` | resources back to their seed, sequences and faker/chaos RNGs rewound (the same seeded failures replay), rate-limit windows, response scripts, hit counts and the journal cleared |
+
+Each journal entry has the method, path, query (repeated params as lists),
+headers, the body (parsed JSON, or text), what matched it (`{"type": "route",
+"name": "create-order"}`, a resource operation, a fixture, or `null` for a
+404), the status and the duration. The journal keeps the last 500 requests
+(`config.journal_size`; `0` turns it off).
+
+A route can also script consecutive calls with `responses:`. With
+`sequence: stick` (the default) the last response repeats; with `cycle` it
+starts over. Injected chaos errors do not advance the script, and a reset
+rewinds it. The shop example's `/exports/{id}` is a polling flow:
+
+```bash
+$ for i in 1 2 3 4; do curl -s -o /dev/null -w "%{http_code} " localhost:8000/exports/9; done
+202 202 200 200
+```
+
+In a Playwright suite (Cypress works the same way with `cy.request`):
+
+```ts
+const MOCK = 'http://localhost:8000';
+
+test.beforeEach(async ({ request }) => {
+  await request.post(`${MOCK}/__mock__/reset`);   // seed data, sequences, chaos, journal
+});
+
+test('checkout places exactly one order', async ({ page, request }) => {
+  await page.goto('/checkout');
+  await page.getByRole('button', { name: 'Place order' }).click();
+  await expect(page.getByText('Order #1000')).toBeVisible();
+
+  const res = await request.get(`${MOCK}/__mock__/requests?route=create-order`);
+  const { count, requests } = await res.json();
+  expect(count).toBe(1);
+  expect(requests[0].body).toMatchObject({ item: 'Keyboard', qty: 2 });
+});
+```
+
 ## mocks.yaml reference
 
 ```yaml
 config:                     # global settings (all optional)
   seed: 7                   # deterministic faker data + chaos
-  cors: true                # add permissive CORS headers + handle preflight
+  cors: true                # CORS headers (Origin echoed, credentials OK) + preflight
+  admin_prefix: /__mock__   # where the admin API lives
+  journal_size: 500         # requests kept in the journal (0 = off)
   latency:                  # default delay for every route
     fixed_ms: 0
   chaos:                    # default error/rate-limit behavior
     error_rate: 0.0
 
 routes:                     # explicit endpoints, tried first
-  - method: GET             # GET | POST | PUT | PATCH | DELETE | ANY
+  - name: product           # optional; sent back as X-Matched-Route, used by the journal
+    method: GET             # GET | POST | PUT | PATCH | DELETE | HEAD | OPTIONS | ANY
     path: /products/{id}    # {param} segments are captured
     priority: 10            # higher wins ties; default 0
     match:                  # optional extra conditions
@@ -234,12 +288,19 @@ routes:                     # explicit endpoints, tried first
       error_body: { error: upstream_unavailable }
       rate_limit: { limit: 60, window_ms: 60000, status: 429 }
     response:
-      status: 200
+      status: 200           # or a template: "{{ request.query.code | default(200) }}"
       headers: { Content-Type: application/json }
       body:                 # inline, templated ...
         id: "{{ request.path.id | int }}"
         name: "{{ faker.name }}"
       # file: ./bodies/thing.json   # ... or loaded from a file (also templated)
+
+  - name: job-status        # scripted: consecutive calls get successive responses
+    path: /jobs/{id}
+    sequence: stick         # stick (repeat the last one, default) | cycle
+    responses:
+      - { status: 202, body: { state: pending } }
+      - { status: 200, body: { state: done } }
 
 resources:                  # in-memory CRUD collections, tried after routes
   - name: todos

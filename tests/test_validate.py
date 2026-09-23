@@ -222,7 +222,7 @@ def test_load_config_strict_raises(tmp_path):
 def test_validate_command_exit_codes(tmp_path, capsys):
     good = os.path.join(ROOT, "examples", "shop-api", "mocks.yaml")
     assert cli.main(["validate", good]) == 0
-    assert "OK (11 routes, 1 resource)" in capsys.readouterr().out
+    assert "OK (12 routes, 1 resource)" in capsys.readouterr().out
 
     broken = tmp_path / "broken.yaml"
     broken.write_text("routes:\n  - methd: GET\n    path: /x\n    response: {status: 999}\n", encoding="utf-8")

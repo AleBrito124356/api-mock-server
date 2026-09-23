@@ -37,7 +37,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 from . import __version__
 from .config import MockConfig, build_config, load_config
 from .openapi_import import import_openapi_to_yaml
-from .server import INDEX_PATH, create_app
+from .server import create_app
 from .validate import Problem, format_report, has_errors, validate_file
 
 ENV_VARS = ("MOCK_CONFIG", "MOCK_HOST", "MOCK_PORT", "MOCK_SEED", "MOCK_UPSTREAM", "MOCK_FIXTURES")
@@ -197,7 +197,7 @@ def _banner(action: str, source: str, config: MockConfig, host: str, port: int) 
     print(f"api-mock-server {action} {source} on http://{host}:{port}", flush=True)
     print(
         f"  routes: {len(config.routes)}  resources: {len(config.resources)}"
-        f"  seed: {config.seed}  index: http://{host}:{port}{INDEX_PATH}",
+        f"  seed: {config.seed}  admin: http://{host}:{port}{config.admin_prefix}",
         flush=True,
     )
 

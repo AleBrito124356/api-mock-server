@@ -19,6 +19,9 @@ from typing import Any, Dict, List, Optional, Pattern, Tuple, Union
 
 import yaml
 
+DEFAULT_ADMIN_PREFIX = "/__mock__"
+DEFAULT_JOURNAL_SIZE = 500
+
 # {param} style path segments -> named regex groups.
 _PARAM = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -63,7 +66,13 @@ class ResponseSpec:
 
 @dataclass
 class RouteSpec:
-    """An explicit endpoint: method + path + optional matchers + response."""
+    """An explicit endpoint: method + path + optional matchers + response.
+
+    A route either has one ``response`` or a scripted list of ``responses``
+    served in order on consecutive calls. ``sequence`` decides what happens
+    after the last one: ``stick`` (default) keeps returning it, ``cycle``
+    starts over. ``response`` is always the first entry.
+    """
 
     method: str
     path: str
@@ -77,9 +86,11 @@ class RouteSpec:
     order: int = 0
     name: Optional[str] = None
     description: Optional[str] = None
+    responses: List[ResponseSpec] = field(default_factory=list)
+    sequence: str = "stick"
 
     def all_responses(self) -> List[ResponseSpec]:
-        return [self.response]
+        return list(self.responses) if self.responses else [self.response]
 
     @property
     def label(self) -> str:
@@ -164,13 +175,25 @@ class MockConfig:
     def global_chaos(self) -> Optional[Dict[str, Any]]:
         return self.settings.get("chaos")
 
+    @property
+    def admin_prefix(self) -> str:
+        """Where the admin API lives (journal, reset, routes)."""
+        prefix = str(self.settings.get("admin_prefix") or DEFAULT_ADMIN_PREFIX)
+        return "/" + prefix.strip("/")
+
+    @property
+    def journal_size(self) -> int:
+        """How many recent requests the journal keeps (0 turns it off)."""
+        return int(self.settings.get("journal_size", DEFAULT_JOURNAL_SIZE))
+
 
 def _build_route(raw: Dict[str, Any], order: int) -> RouteSpec:
     method = str(raw.get("method", "GET")).upper()
     path = str(raw.get("path", "/"))
     regex, names = compile_path(path)
 
-    response = _build_response(raw.get("response") or {})
+    responses = [_build_response(r or {}) for r in raw.get("responses") or []]
+    response = responses[0] if responses else _build_response(raw.get("response") or {})
     name = raw.get("name")
     return RouteSpec(
         method=method,
@@ -185,6 +208,8 @@ def _build_route(raw: Dict[str, Any], order: int) -> RouteSpec:
         order=order,
         name=str(name) if name is not None else None,
         description=raw.get("description"),
+        responses=responses,
+        sequence=str(raw.get("sequence", "stick")).lower(),
     )
 
 

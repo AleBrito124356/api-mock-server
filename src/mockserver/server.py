@@ -6,8 +6,8 @@ header and body, so it does its own matching inside the catch-all. The
 match pipeline is:
 
     request
-      -> mock index         (GET /__mock__)
       -> CORS preflight     (OPTIONS + Origin + Access-Control-Request-Method)
+      -> admin API          (/__mock__: index, routes, request journal, reset)
       -> explicit routes    (first match wins; ties broken by priority)
       -> stateful resources (CRUD)
       -> record / replay    (if a record block is configured)
@@ -15,6 +15,11 @@ match pipeline is:
 
 For each matched explicit route the behavior pipeline runs before the
 response is built: rate limit -> error injection -> latency -> template render.
+A route with a ``responses:`` list serves them in order on consecutive calls.
+
+Every non-admin request is written to the request journal so tests can
+verify what the frontend called; ``POST /__mock__/reset`` rewinds resources,
+sequences, RNGs, rate limits, response sequences and the journal.
 
 Anything that goes wrong while building a response (a broken template, a
 missing body file, an unreachable upstream) comes back as a JSON error that
@@ -28,6 +33,7 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import anyio
@@ -40,6 +46,7 @@ from starlette.routing import Route
 from .behavior import BehaviorEngine
 from .config import MockConfig, ResourceSpec, ResponseSpec, RouteSpec, load_config
 from .dynamic import TemplateEngine, TemplateError
+from .journal import Journal
 from .record import build_recorder
 from .stateful import ResourceConflict, ResourceRouter
 
@@ -54,7 +61,14 @@ _CORS_SAFELISTED = {
     "expires", "last-modified", "pragma",
 }
 
-INDEX_PATH = "/__mock__"
+INDEX_PATH = "/__mock__"  # default admin prefix (config.admin_prefix)
+ADMIN_ENDPOINTS = [
+    "GET    {p}            index: routes, resources, record and watch status",
+    "GET    {p}/routes     routes with match conditions and hit counts",
+    "GET    {p}/requests   request journal (?method= &path= &route= &status= &since= &limit=)",
+    "DELETE {p}/requests   clear the journal",
+    "POST   {p}/reset      reset resources, sequences, RNGs, rate limits, response sequences, journal",
+]
 
 
 class _JsonNull:
@@ -177,6 +191,9 @@ class MockServer:
         # Hot reload (serve --watch): re-read the mocks file when it changes.
         if watch and not config.source_path:
             raise ValueError("watch=True needs a config loaded from a file (load_config)")
+        self.journal = Journal(config.journal_size)
+        self.cursors: Dict[str, int] = {}
+        self.hits: Dict[str, int] = defaultdict(int)
         self.watch = watch
         self.watch_interval = watch_interval
         self.reload_count = 0
@@ -259,8 +276,15 @@ class MockServer:
                 build_recorder(new.record, new.base_dir, transport=self._upstream_transport)
                 if new.record else None
             )
+        old_scripts = {r.key: repr(r.all_responses()) for r in self.config.routes}
+        new_scripts = {r.key: repr(r.all_responses()) for r in new.routes}
+        cursors = {k: v for k, v in self.cursors.items() if old_scripts.get(k) == new_scripts.get(k)}
+        journal = self.journal
+        if new.journal_size != journal.size:
+            journal = Journal(new.journal_size)
         # Swap everything in one synchronous step so no request sees a mix.
         self.config, self.matcher, self.resources, self.recorder = new, matcher, resources, recorder
+        self.cursors, self.journal = cursors, journal
         if old_recorder is not None and old_recorder is not recorder:
             await old_recorder.aclose()
 
@@ -327,13 +351,24 @@ class MockServer:
         if gate is not None:
             return self._tag_route(gate, route)
 
-        response = route.response
+        response = self._next_response(route)
         headers = {k: _header_str(self.engine.render(v, ctx)) for k, v in response.headers.items()}
         status = self._resolve_status(response, ctx)
         body = self._resolve_body(response, ctx, headers)
         if info["method"] == "HEAD":
             body = None
         return self._tag_route(self._make_response(status, body, headers), route)
+
+    def _next_response(self, route: RouteSpec) -> ResponseSpec:
+        """Pick the response for this call (advances ``responses:`` scripts)."""
+        responses = route.all_responses()
+        if len(responses) == 1:
+            return responses[0]
+        index = self.cursors.get(route.key, 0)
+        self.cursors[route.key] = index + 1
+        if route.sequence == "cycle":
+            return responses[index % len(responses)]
+        return responses[min(index, len(responses) - 1)]
 
     @staticmethod
     def _tag_route(response: Response, route: RouteSpec) -> Response:
@@ -556,6 +591,7 @@ class MockServer:
             {"name": r.name, "method": r.method, "path": r.path, "priority": r.priority}
             for r in self.config.routes
         ]
+        prefix = self.config.admin_prefix
         resources = [{"name": s.name, "path": s.path} for s in self.config.resources]
         return self._make_response(
             200,
@@ -569,6 +605,9 @@ class MockServer:
                     "reloads": self.reload_count,
                     "errors": self.reload_errors,
                 },
+                "journal": {"enabled": self.journal.enabled, "size": self.journal.size,
+                            "entries": len(self.journal)},
+                "admin": [e.format(p=prefix) for e in ADMIN_ENDPOINTS],
             },
             {},
         )
@@ -581,20 +620,99 @@ class MockServer:
                 "method": info["method"],
                 "path": info["path"],
                 "hint": "No explicit route, resource or fixture matched this request. "
-                        f"GET {INDEX_PATH} lists what is configured.",
+                        f"GET {self.config.admin_prefix} lists what is configured.",
                 "configured_routes": len(self.config.routes),
                 "configured_resources": len(self.config.resources),
             },
             {},
         )
 
+    # -- admin API -------------------------------------------------------- #
+    def _is_admin(self, path: str) -> bool:
+        prefix = self.config.admin_prefix
+        return path == prefix or path.startswith(prefix + "/")
+
+    def _admin(self, info: Dict[str, Any]) -> Response:
+        prefix = self.config.admin_prefix
+        sub = info["path"][len(prefix):].strip("/")
+        method = info["method"]
+        if sub == "":
+            if method in ("GET", "HEAD"):
+                return self._index()
+            return self._admin_405("GET")
+        if sub == "routes":
+            if method in ("GET", "HEAD"):
+                return self._make_response(200, self._routes_listing(), {})
+            return self._admin_405("GET")
+        if sub == "requests":
+            if method in ("GET", "HEAD"):
+                entries = self.journal.query(info["query"])
+                return self._make_response(200, {"count": len(entries), "requests": entries}, {})
+            if method == "DELETE":
+                cleared = self.journal.clear()
+                return self._make_response(200, {"cleared": cleared}, {})
+            return self._admin_405("GET, DELETE")
+        if sub == "reset":
+            if method == "POST":
+                return self._make_response(200, self.reset(), {})
+            return self._admin_405("POST")
+        return self._make_response(
+            404,
+            {"error": "unknown_admin_endpoint", "path": info["path"],
+             "endpoints": [e.format(p=prefix) for e in ADMIN_ENDPOINTS]},
+            {},
+        )
+
+    def _admin_405(self, allow: str) -> Response:
+        return self._make_response(405, {"error": "method_not_allowed", "allow": allow}, {"allow": allow})
+
+    def _routes_listing(self) -> Dict[str, Any]:
+        routes = []
+        for route in self.matcher.routes:  # in match order
+            entry: Dict[str, Any] = {
+                "name": route.name,
+                "method": route.method,
+                "path": route.path,
+                "priority": route.priority,
+                "match": route.match or None,
+                "hits": self.hits.get(route.key, 0),
+            }
+            responses = route.all_responses()
+            if len(responses) > 1:
+                entry["responses"] = len(responses)
+                entry["sequence"] = route.sequence
+                entry["next_response"] = self._peek_index(route)
+            routes.append(entry)
+        resources = [
+            {"name": spec.name, "path": spec.path, "items": len(self.resources.store_for(spec))}
+            for spec in self.config.resources
+        ]
+        return {"routes": routes, "resources": resources}
+
+    def _peek_index(self, route: RouteSpec) -> int:
+        index = self.cursors.get(route.key, 0)
+        n = len(route.all_responses())
+        return index % n if route.sequence == "cycle" else min(index, n - 1)
+
+    def reset(self) -> Dict[str, Any]:
+        """Rewind all runtime state to how the server started."""
+        resources = self.resources.reset()
+        self.engine.reset()
+        self.behavior.reset()
+        self.cursors.clear()
+        self.hits.clear()
+        cleared = self.journal.clear()
+        return {
+            "reset": True,
+            "resources": resources,
+            "journal_cleared": cleared,
+            "also_reset": ["sequences", "faker rng", "chaos rng", "rate limits",
+                           "response sequences", "route hit counts"],
+        }
+
     # -- dispatch --------------------------------------------------------- #
     async def _route_request(self, info: Dict[str, Any], trace: Dict[str, Any]) -> Response:
         method, path = info["method"], info["path"]
-
-        if method in ("GET", "HEAD") and path == INDEX_PATH:
-            trace["matched"] = {"type": "index"}
-            return self._index()
 
         if self.config.cors and self._is_preflight(info):
             # A route declared with `method: OPTIONS` still wins over the
@@ -603,14 +721,20 @@ class MockServer:
             if hit is not None:
                 route, params = hit
                 trace["matched"] = {"type": "route", "name": route.label}
+                self.hits[route.key] += 1
                 return await self._serve_route(route, info, params)
             trace["matched"] = {"type": "preflight"}
             return self._cors_preflight(info)
+
+        if self._is_admin(path):
+            trace["admin"] = True
+            return self._admin(info)
 
         hit = self.matcher.match(method, path, info)
         if hit is not None:
             route, params = hit
             trace["matched"] = {"type": "route", "name": route.label}
+            self.hits[route.key] += 1
             return await self._serve_route(route, info, params)
 
         op = self.resources.match(method, path)
@@ -657,6 +781,7 @@ class MockServer:
         return self._make_response(500, body, {})
 
     async def dispatch(self, request: Request) -> Response:
+        started = time.perf_counter()
         await self.maybe_reload()
         info = await self._build_info(request)
         trace: Dict[str, Any] = {}
@@ -666,6 +791,10 @@ class MockServer:
             response = self._error_response(exc, trace, info)
         if self.config.cors:
             self._apply_cors(response, info)
+        if not trace.get("admin"):
+            self.journal.record(
+                info, response.status_code, trace.get("matched"), (time.perf_counter() - started) * 1000
+            )
         return response
 
 

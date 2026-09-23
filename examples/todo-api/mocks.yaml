@@ -11,7 +11,8 @@
 #   PATCH  /todos/{id}        partial update
 #   DELETE /todos/{id}        delete -> 204
 #
-# State lives in memory and resets when the server restarts.
+# State lives in memory. POST /__mock__/reset puts the seed data back, which
+# is what an e2e suite calls before each test.
 
 config:
   cors: true

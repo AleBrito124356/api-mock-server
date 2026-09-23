@@ -139,6 +139,30 @@ async def test_throttle_skips_checks_between_intervals(tmp_path):
         assert (await client.get("/hello")).json() == {"msg": "v1"}
 
 
+@pytest.mark.asyncio
+async def test_sequence_position_survives_unrelated_edits_but_not_script_edits(tmp_path):
+    script = """
+routes:
+  - name: job
+    path: /job
+    responses:
+      - {status: 202}
+      - {status: 200, body: %s}
+  - name: other
+    path: /other
+    response: {body: %s}
+"""
+    cfg = tmp_path / "mocks.yaml"
+    _write(cfg, script % ("done", "a"))
+    async with make_client(_app(cfg)) as client:
+        assert (await client.get("/job")).status_code == 202
+        _write(cfg, script % ("done", "b"))  # only the other route changed
+        assert (await client.get("/other")).text == "b"
+        assert (await client.get("/job")).status_code == 200
+        _write(cfg, script % ("finished", "b"))  # the script itself changed
+        assert (await client.get("/job")).status_code == 202
+
+
 def test_watch_requires_a_file_backed_config():
     from mockserver import build_config
 

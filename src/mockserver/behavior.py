@@ -43,6 +43,15 @@ class BehaviorEngine:
         self.rng = Random(seed)
         self._buckets: Dict[str, Deque[float]] = defaultdict(deque)
 
+    def reset(self) -> None:
+        """Rewind the RNG to its seed and empty every rate-limit window.
+
+        After a reset the same seeded sequence of failures and delays plays
+        again from the start, which is what an e2e suite wants between tests.
+        """
+        self.rng = Random(self.seed)
+        self._buckets.clear()
+
     # -- latency ---------------------------------------------------------- #
     def latency_seconds(self, spec: Optional[Dict[str, Any]]) -> float:
         if not spec:

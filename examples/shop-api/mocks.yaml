@@ -150,6 +150,26 @@ routes:
           - "{{ faker.words(2) }}"
           - "{{ faker.words(2) }}"
 
+  # --- Scripted behaviour ---------------------------------------------------
+
+  # A polling flow: the export is "processing" twice, then done. With
+  # `sequence: stick` the last response repeats; `cycle` would start over.
+  # POST /__mock__/reset rewinds it for the next test.
+  - name: export-status
+    method: GET
+    path: /exports/{id}
+    sequence: stick
+    responses:
+      - status: 202
+        body: { id: "{{ request.path.id }}", status: processing, progress: 30 }
+      - status: 202
+        body: { id: "{{ request.path.id }}", status: processing, progress: 80 }
+      - status: 200
+        body:
+          id: "{{ request.path.id }}"
+          status: done
+          url: "https://files.example.com/exports/{{ request.path.id }}.csv"
+
   # --- Misc -----------------------------------------------------------------
 
   # Body loaded from a file next to this one (the file is templated too).
