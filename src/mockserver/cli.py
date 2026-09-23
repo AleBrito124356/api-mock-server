@@ -4,7 +4,7 @@
     mockserver replay   [--fixtures DIR] [--config mocks.yaml] [--host] [--port] [--seed]
     mockserver record   [--upstream URL] [--fixtures DIR] [--config] [--host] [--port] [--seed]
     mockserver validate FILE [FILE ...] [--strict] [--json]
-    mockserver import-openapi <spec> [--out mocks.yaml]
+    mockserver import-openapi <spec> [--out mocks.yaml] [--base-path auto] [--dynamic] [--resources]
     mockserver --version
 
 ``serve``, ``replay`` and ``record`` validate the mocks file, then boot the
@@ -36,7 +36,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from . import __version__
 from .config import MockConfig, build_config, load_config
-from .openapi_import import import_openapi_to_yaml
+from .openapi_import import detect_base_path, import_openapi, load_spec, write_mocks_yaml
 from .server import create_app
 from .validate import Problem, format_report, has_errors, validate_file
 
@@ -304,10 +304,23 @@ def _cmd_import(args: argparse.Namespace) -> int:
     if not os.path.exists(args.spec):
         sys.stderr.write(f"OpenAPI spec not found: {args.spec}\n")
         return 1
-    count = import_openapi_to_yaml(args.spec, args.out)
-    print(f"Imported {count} route(s) from {args.spec} -> {args.out}")
+    try:
+        spec = load_spec(args.spec)
+        config = import_openapi(args.spec, base_path=args.base_path, dynamic=args.dynamic,
+                                resources=args.resources)
+    except ValueError as exc:
+        sys.stderr.write(f"Cannot import {args.spec}: {exc}\n")
+        return 1
+    write_mocks_yaml(config, args.spec, args.out, dynamic=args.dynamic, resources=args.resources)
+    routes, resources = len(config["routes"]), len(config.get("resources") or [])
+    print(f"Imported {routes} route(s) and {resources} resource(s) from {args.spec} -> {args.out}")
+    base = detect_base_path(spec) if args.base_path == "auto" else args.base_path.strip()
+    if base.strip("/"):
+        print(f"  paths are prefixed with /{base.strip('/')} (--base-path / keeps the spec's paths)")
+    problems = validate_file(args.out)
+    print(format_report(args.out, problems))
     print(f"Serve it with:  mockserver serve --config {args.out}")
-    return 0
+    return 1 if has_errors(problems) else 0
 
 
 # --------------------------------------------------------------------------- #
@@ -391,6 +404,14 @@ def build_parser(env: Optional[EnvDefaults] = None) -> argparse.ArgumentParser:
     imp = sub.add_parser("import-openapi", parents=[common], help="Build a mocks file from an OpenAPI spec.")
     imp.add_argument("spec", help="Path to the OpenAPI 3 document (YAML or JSON).")
     imp.add_argument("--out", "-o", default="mocks.yaml", help="Output mocks file.")
+    imp.add_argument("--base-path", default="auto", metavar="PATH",
+                     help="Prefix for every path. 'auto' (default) uses the path of servers[0].url / "
+                          "basePath, e.g. /v1; '/' keeps the spec's paths unchanged.")
+    imp.add_argument("--dynamic", action="store_true",
+                     help="Emit templates (echo path params and request fields, faker values) "
+                          "instead of frozen example values.")
+    imp.add_argument("--resources", action="store_true",
+                     help="Turn collection + item paths (/pets, /pets/{id}) into stateful CRUD resources.")
     imp.set_defaults(func=_cmd_import)
 
     return parser

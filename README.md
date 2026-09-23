@@ -1,11 +1,11 @@
 # api-mock-server
 
-**A config-driven mock REST API for frontend dev and testing.** Define endpoints in YAML, get templated dynamic responses, latency and error injection, stateful CRUD resources, OpenAPI import, and record-and-replay — no handler code.
+**A config-driven mock REST API for frontend dev and testing.** Define endpoints in YAML, get templated dynamic responses, latency and error injection, stateful CRUD resources, OpenAPI import, record-and-replay, config validation with hot reload, and a request journal your e2e tests can assert on — no handler code.
 
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Starlette](https://img.shields.io/badge/ASGI-Starlette-ff69b4)
-![Tests](https://img.shields.io/badge/tests-170%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-197%20passing-brightgreen)
 
 ---
 
@@ -18,25 +18,34 @@ You are building a frontend and the backend does not exist yet. Or it exists but
 - **Dynamic bodies** — `{{ faker.name }}`, `{{ seq.order }}`, `{{ request.path.id }}` so mock data looks real and varies per call instead of being one frozen fixture.
 - **Chaos on purpose** — inject latency and errors to test how your UI behaves on a bad network, seeded so failures are reproducible.
 - **Stateful CRUD** — declare a resource and get `GET/POST/PUT/PATCH/DELETE` backed by an in-memory store, so a prototype can actually create and edit records.
-- **OpenAPI import** — turn a contract into a runnable mock in one command.
+- **OpenAPI import** — turn a contract (OpenAPI 3 or Swagger 2) into a runnable mock in one command, with request-aware templates or real CRUD if you ask for them.
 - **Record and replay** — proxy a real upstream once, then work offline against saved fixtures.
+- **Typos are errors** — `mockserver validate` reports misspelt keys and template expressions with "did you mean" hints, and `serve --watch` applies edits without a restart.
+- **Built for e2e suites** — a request journal to assert what the frontend called, a reset endpoint, and scripted response sequences for polling and retry flows.
 
 It is a small, dependency-light Python package on Starlette. The whole thing is driven by config, so a designer or a QA engineer can change a response without touching code.
 
 ## How it works
 
-Every request goes through one match pipeline. Explicit routes are tried first, in priority order; then stateful resources; then record/replay; then a helpful 404.
+Every request goes through one match pipeline. CORS preflights and the admin
+API are answered first; then explicit routes in priority order; then stateful
+resources; then record/replay; then a helpful 404. Every non-admin request is
+written to the request journal.
 
 ```mermaid
 flowchart TD
-    A[Incoming request] --> B{Explicit route match}
+    A[Incoming request] --> P{CORS preflight?}
+    P -- yes --> P1[204 with allow-* headers]
+    P -- no --> M{Admin path /__mock__?}
+    M -- yes --> M1[Index, routes, journal, reset]
+    M -- no --> B{Explicit route match}
     B -- "method + path + query/header/body" --> C[Behavior gate]
     B -- no match --> D{Stateful resource match}
     C --> C1[Rate limit check]
     C1 --> C2[Error injection]
     C2 --> C3[Latency delay]
-    C3 --> C4[Render template body]
-    C4 --> Z[Response]
+    C3 --> C4[Next scripted response, render template]
+    C4 --> Z[Response + journal entry]
     D -- collection or item --> E[CRUD on in-memory store]
     E --> Z
     D -- no match --> F{Record mode configured}
@@ -49,6 +58,11 @@ flowchart TD
 ```
 
 Routes are ordered by `priority` descending, then by declaration order, and the **first** route whose method, path, and match conditions all satisfy wins. That is how a specific `/products?category=books` route can shadow the generic `/products` list.
+
+If building a response fails (a broken template, a missing body file), the
+answer is a JSON 500 that names the route and the expression, e.g.
+`{"error": "mock_error", "route": "bad-route", "expression": "faker.int(a, b)", "detail": "..."}`,
+never an opaque "Internal Server Error".
 
 ## Quickstart
 
@@ -111,7 +125,7 @@ $ curl -s localhost:8000/products/42 | jq '.id'
 42
 
 # Create endpoints can echo the request body and mint ids from a sequence:
-$ curl -s -X POST localhost:8000/orders        -H 'content-type: application/json' -d '{"item":"Keyboard","qty":2}'
+$ curl -s -X POST localhost:8000/orders -H 'content-type: application/json' -d '{"item":"Keyboard","qty":2}'
 {"id": 1000, "status": "pending", "item": "Keyboard", "qty": 2, "customer": "guest", "created_at": "2026-09-23T11:29:50"}
 
 # Body matching: a zero quantity hits the higher-priority validation route.
@@ -141,18 +155,61 @@ $ curl -s -X POST localhost:8000/todos \
 { "title": "Wire up the API", "done": false, "id": 4 }     # 201 Created, Location: /todos/4
 
 $ curl -s 'localhost:8000/todos?done=false&_sort=id&_limit=2'   # filter, sort, paginate
+[{"id": 2, "title": "Wire up the API", "done": false}, {"id": 3, "title": "Write the e2e tests", "done": false}]
+
 $ curl -s -X PATCH localhost:8000/todos/4 -d '{"done":true}' -H 'content-type: application/json'
 $ curl -s -X DELETE localhost:8000/todos/4 -i                    # 204 No Content
+
+$ curl -s -X POST localhost:8000/todos -H 'content-type: application/json' -d '[1,2,3]'
+{"error": "invalid_body", "resource": "todos", "message": "Expected a JSON object, got array."}
 ```
 
-### Import an OpenAPI 3 spec
+Listing supports field filters (`?done=false`), `_q` full-text search,
+`_sort`/`_order`, `_limit`/`_offset` and `_page`/`_per_page`, and always sends
+`X-Total-Count`. A body that is not a JSON object is a 400, and a POST that
+reuses an existing id is a 409 instead of silently overwriting it. With
+`cors: true` a browser app on another origin can use every method: preflights
+are answered, `Origin` is echoed with credentials allowed, and headers such as
+`X-Total-Count` and `Location` are exposed to JavaScript.
+
+### Import an OpenAPI spec
 
 ```bash
 mockserver import-openapi examples/openapi-import/petstore.yaml -o petstore.mocks.yaml
 mockserver serve --config petstore.mocks.yaml
+curl localhost:8000/v1/pets
 ```
 
-Response bodies are taken from the spec's response examples, then schema examples, then synthesized from the schema (respecting `example`, `default`, `enum`, and `format`).
+The importer reads OpenAPI 3.0/3.1 and Swagger 2.0 (YAML or JSON), resolves
+`$ref`s, and writes a commented mocks file that it immediately validates.
+Status keys can be quoted or bare (`200:`), ranges (`2XX`) or `default`.
+Bodies come from response examples, then schema examples, then are synthesized
+from the schema, respecting `example`, `default`, `const`, `enum`, `format`,
+`pattern` (a matching string is generated, e.g. `^[A-Z]{3}$` gives `ABC`),
+`minimum`/`maximum` and their exclusive forms, `multipleOf`,
+`minLength`/`maxLength`, `minItems` and nullable types.
+
+| Flag | Effect |
+|---|---|
+| `--base-path auto` (default) | prefix paths with the path of `servers[0].url` (or Swagger `basePath`): `https://api.petstore.example/v1` makes `/pets` into `/v1/pets`. `--base-path /` keeps the spec's paths. |
+| `--dynamic` | templates instead of frozen values: path params echo into the matching field, write operations echo request-body fields, POST ids come from a sequence, formats and field names map to faker (`email`, `uuid`, `date-time`, `uri`, `name`, `city`, `phone`...), numbers stay inside their bounds, enums become `faker.choice(...)`, and array responses get three generated items |
+| `--resources` | collection + item pairs (`/pets` and `/pets/{petId}`) become stateful `resources:` seeded from the spec's list example, so writes really persist |
+
+```bash
+$ mockserver import-openapi examples/openapi-import/petstore.yaml -o pets.yaml --dynamic
+$ mockserver serve --config pets.yaml
+$ curl -s localhost:8000/v1/pets/123
+{"id": 123, "name": "Noah Brito", "tag": "pixel", "status": "pending", "created_at": "2026-09-23T11:47:49"}
+
+$ mockserver import-openapi examples/openapi-import/petstore.yaml -o pets.yaml --resources
+$ mockserver serve --config pets.yaml
+$ curl -s -X POST localhost:8000/v1/pets -H 'content-type: application/json' -d '{"name":"Nemo","tag":"fish"}'
+{"name": "Nemo", "tag": "fish", "id": 3}                    # 201, Location: /v1/pets/3
+```
+
+In Python, `import_openapi(path, base_path=None, dynamic=False, resources=False)`
+returns the config dict; its default `base_path=None` keeps the spec's paths,
+as in 0.1.x.
 
 ### Record and replay
 
@@ -324,14 +381,17 @@ record:                     # optional proxy-and-record block
 | `{{ request.path.id }}` | captured `{id}` path param |
 | `{{ request.header.X-Api-Key }}` | request header, case-insensitive |
 | `{{ request.body.user.name }}` | nested field from the JSON body |
-| `{{ faker.name }}` `faker.email` `faker.uuid` `faker.city` | fake data |
+| `{{ faker.name }}` `faker.email` `faker.uuid` `faker.city` `faker.url` `faker.phone` | fake data (`mockserver validate` lists typos) |
 | `{{ faker.int(1, 100) }}` `faker.price(5, 500)` `faker.bool` | typed fakes |
+| `{{ faker.choice('a', 'b', 'c') }}` | one of the given values |
 | `{{ seq.order }}` `{{ seq.invoice(1000, 5) }}` | incrementing counter |
 | `{{ now.iso }}` `now.date` `now.timestamp` | current time |
 | `{{ uuid }}` | random uuid4 |
-| `\| default(1) \| int \| upper \| round(2) \| json` | chained filters |
+| `{{ env.API_URL }}` | environment variable |
+| `{{ 'text' }}` `{{ 42 }}` `{{ true }}` `{{ null }}` | literals |
+| `\| default(1) \| int \| float \| upper \| lower \| title \| round(2) \| json` | chained filters |
 
-When a value is exactly one `{{ expr }}`, its native type is preserved — `{{ faker.int(1, 5) }}` yields a JSON number, not a string. Embedded expressions like `"id-{{ seq.n }}"` are stringified.
+When a value is exactly one `{{ expr }}`, its native type is preserved — `{{ faker.int(1, 5) }}` yields a JSON number, not a string. Anything else is interpolated into a string, including several tokens: `"{{ faker.first_name }} {{ faker.last_name }}"` or `"id-{{ seq.n }}"`. Non-string bodies (numbers, booleans, `null`) are sent as JSON. An unknown faker helper or filter is reported by `mockserver validate` and, if you start anyway, answered with a JSON `mock_error` naming the expression.
 
 ## Project structure
 
@@ -340,16 +400,23 @@ api-mock-server/
 ├── cli.py                         # run straight from a checkout
 ├── src/mockserver/
 │   ├── config.py                  # YAML -> typed model, path compilation
-│   ├── server.py                  # ASGI app, match pipeline, dispatch
-│   ├── dynamic.py                 # {{ ... }} templating + seedable faker
+│   ├── server.py                  # ASGI app, match pipeline, admin API, hot reload
+│   ├── dynamic.py                 # {{ ... }} parsing/templating + seedable faker
 │   ├── behavior.py                # latency, error injection, rate limiting
 │   ├── stateful.py                # in-memory CRUD resources
-│   ├── openapi_import.py          # OpenAPI 3 -> mocks skeleton
+│   ├── journal.py                 # bounded request journal for verification
+│   ├── validate.py                # mocks-file validation with did-you-mean hints
+│   ├── openapi_import.py          # OpenAPI 3 / Swagger 2 -> mocks (static, dynamic, resources)
 │   ├── record.py                  # proxy-and-record / offline replay
-│   └── cli.py                     # serve / import-openapi / record
+│   └── cli.py                     # serve / replay / record / validate / import-openapi
 ├── examples/                      # shop API, todo API, OpenAPI import
-└── tests/                         # matching, templating, CRUD, chaos, import, record
+└── tests/                         # one file per feature, all offline (no network, no keys)
 ```
+
+Run the tests with `pip install -e ".[dev]"` and `pytest`. They need no
+network: the record tests use `httpx.MockTransport` as the upstream
+(`create_app(config, upstream_transport=...)`), and the CLI tests replace
+uvicorn with a stub.
 
 ## How it compares
 
@@ -362,6 +429,7 @@ api-mock-server/
 | Latency + error injection | seeded, per-route | via CLI flags | yes | no |
 | Stateful CRUD out of the box | yes | no | via scenarios | yes |
 | Record and replay | yes | proxy mode | yes | no |
+| Request journal + reset API for e2e tests | yes | no | yes | no |
 | Runtime | Python / Starlette | Node | Java / JVM | Node |
 
 **Honest take:** if you already have a maintained OpenAPI contract and only need spec-conformant responses, [Prism](https://github.com/stoplightio/prism) validates against the spec and is the better fit. If you live in the JVM or need enterprise matching features, [WireMock](https://github.com/wiremock/wiremock) is more battle-tested. [json-server](https://github.com/typicode/json-server) is the fastest path to plain REST-over-JSON. `api-mock-server` is for when you want **one readable file** that mixes stateful CRUD, hand-crafted dynamic responses, and deliberate chaos — in a Python stack, without a spec as a prerequisite.
