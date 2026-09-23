@@ -6,41 +6,76 @@ header and body, so it does its own matching inside the catch-all. The
 match pipeline is:
 
     request
-      -> explicit routes   (first match wins; ties broken by priority)
+      -> CORS preflight     (OPTIONS + Origin + Access-Control-Request-Method)
+      -> admin API          (/__mock__: index, routes, request journal, reset)
+      -> explicit routes    (first match wins; ties broken by priority)
       -> stateful resources (CRUD)
       -> record / replay    (if a record block is configured)
       -> index / 404
 
 For each matched explicit route the behavior pipeline runs before the
 response is built: rate limit -> error injection -> latency -> template render.
+A route with a ``responses:`` list serves them in order on consecutive calls.
+
+Every non-admin request is written to the request journal so tests can
+verify what the frontend called; ``POST /__mock__/reset`` rewinds resources,
+sequences, RNGs, rate limits, response sequences and the journal.
+
+Anything that goes wrong while building a response (a broken template, a
+missing body file, an unreachable upstream) comes back as a JSON error that
+names the route or expression involved, never as an opaque "Internal Server
+Error".
 """
 from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
+import time
+from collections import defaultdict
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import anyio
+import httpx
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
 from .behavior import BehaviorEngine
-from .config import MockConfig, ResourceSpec, ResponseSpec, RouteSpec
-from .dynamic import TemplateEngine
+from .config import MockConfig, ResourceSpec, ResponseSpec, RouteSpec, load_config
+from .dynamic import TemplateEngine, TemplateError
+from .journal import Journal
 from .record import build_recorder
-from .stateful import ResourceRouter
+from .stateful import ResourceConflict, ResourceRouter
+
+logger = logging.getLogger("mockserver")
 
 _ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
+_ALLOW_METHODS = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
 
-_CORS_HEADERS = {
-    "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD",
-    "access-control-allow-headers": "*",
-    "access-control-max-age": "600",
+# Response headers a browser exposes to JS without being told to.
+_CORS_SAFELISTED = {
+    "cache-control", "content-language", "content-length", "content-type",
+    "expires", "last-modified", "pragma",
 }
+
+INDEX_PATH = "/__mock__"  # default admin prefix (config.admin_prefix)
+ADMIN_ENDPOINTS = [
+    "GET    {p}            index: routes, resources, record and watch status",
+    "GET    {p}/routes     routes with match conditions and hit counts",
+    "GET    {p}/requests   request journal (?method= &path= &route= &status= &since= &limit=)",
+    "DELETE {p}/requests   clear the journal",
+    "POST   {p}/reset      reset resources, sequences, RNGs, rate limits, response sequences, journal",
+]
+
+
+class _JsonNull:
+    """Marker for "send the JSON literal null" (as opposed to an empty body)."""
+
+
+JSON_NULL = _JsonNull()
 
 
 class Matcher:
@@ -49,10 +84,20 @@ class Matcher:
     def __init__(self, routes: List[RouteSpec]) -> None:
         self.routes = sorted(routes, key=lambda r: (-r.priority, r.order))
 
-    def match(self, method: str, path: str, info: Dict[str, Any]) -> Optional[Tuple[RouteSpec, Dict[str, str]]]:
-        effective = "GET" if method == "HEAD" else method
+    def match(
+        self,
+        method: str,
+        path: str,
+        info: Dict[str, Any],
+        explicit_only: bool = False,
+    ) -> Optional[Tuple[RouteSpec, Dict[str, str]]]:
+        """First route that matches. ``explicit_only`` ignores ANY/* routes."""
+        # HEAD is answered by HEAD routes first, then by GET routes.
+        allowed: Tuple[str, ...] = (method, "GET") if method == "HEAD" else (method,)
+        if not explicit_only:
+            allowed += ("ANY", "*")
         for route in self.routes:
-            if route.method not in (effective, "ANY", "*"):
+            if route.method not in allowed:
                 continue
             m = route.regex.match(path)
             if not m:
@@ -72,7 +117,7 @@ def _conditions_met(match: Dict[str, Any], info: Dict[str, Any]) -> bool:
         if expected == "*":
             if actual is None:
                 return False
-        elif actual is None or str(actual) != str(expected):
+        elif actual is None or str(actual) != _match_str(expected):
             return False
 
     headers = info.get("headers") or {}
@@ -81,13 +126,20 @@ def _conditions_met(match: Dict[str, Any], info: Dict[str, Any]) -> bool:
         if expected == "*":
             if actual is None:
                 return False
-        elif actual is None or str(actual) != str(expected):
+        elif actual is None or str(actual) != _match_str(expected):
             return False
 
     if "body" in match:
         if not _subset(match["body"], info.get("json")):
             return False
     return True
+
+
+def _match_str(expected: Any) -> str:
+    # YAML turns `flag: true` into a bool; the query string says "true".
+    if isinstance(expected, bool):
+        return "true" if expected else "false"
+    return str(expected)
 
 
 def _subset(expected: Any, actual: Any) -> bool:
@@ -102,32 +154,159 @@ def _subset(expected: Any, actual: Any) -> bool:
     return expected == actual
 
 
+def _is_json_type(content_type: Optional[str]) -> bool:
+    ct = (content_type or "").lower()
+    return "json" in ct
+
+
+def _header_str(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return str(value)
+
+
 class MockServer:
     """Owns the engines and the per-request dispatch logic."""
 
-    def __init__(self, config: MockConfig) -> None:
+    def __init__(
+        self,
+        config: MockConfig,
+        *,
+        upstream_transport: Optional[httpx.AsyncBaseTransport] = None,
+        watch: bool = False,
+        watch_interval: float = 0.5,
+    ) -> None:
         self.config = config
         self.engine = TemplateEngine(seed=config.seed)
         self.behavior = BehaviorEngine(seed=config.seed)
         self.matcher = Matcher(config.routes)
         self.resources = ResourceRouter(config.resources)
-        self.recorder = build_recorder(config.record, config.base_dir) if config.record else None
+        self._upstream_transport = upstream_transport
+        self.recorder = (
+            build_recorder(config.record, config.base_dir, transport=upstream_transport)
+            if config.record else None
+        )
+        # Hot reload (serve --watch): re-read the mocks file when it changes.
+        if watch and not config.source_path:
+            raise ValueError("watch=True needs a config loaded from a file (load_config)")
+        self.journal = Journal(config.journal_size)
+        self.cursors: Dict[str, int] = {}
+        self.hits: Dict[str, int] = defaultdict(int)
+        self.watch = watch
+        self.watch_interval = watch_interval
+        self.reload_count = 0
+        self.reload_errors: List[str] = []
+        self._watch_snapshot = self._snapshot() if watch else {}
+        self._last_watch_check = time.monotonic()
+
+    # -- hot reload ------------------------------------------------------- #
+    def _watched_files(self) -> List[str]:
+        files = [self.config.source_path] if self.config.source_path else []
+        return files + self.config.body_files()
+
+    def _snapshot(self) -> Dict[str, Optional[int]]:
+        snap: Dict[str, Optional[int]] = {}
+        for path in self._watched_files():
+            try:
+                snap[path] = os.stat(path).st_mtime_ns
+            except OSError:
+                snap[path] = None
+        return snap
+
+    async def maybe_reload(self) -> None:
+        """Reload the config if a watched file changed (throttled)."""
+        if not self.watch:
+            return
+        now = time.monotonic()
+        if now - self._last_watch_check < self.watch_interval:
+            return
+        self._last_watch_check = now
+        snapshot = self._snapshot()
+        if snapshot == self._watch_snapshot:
+            return
+        self._watch_snapshot = snapshot
+        await self.reload()
+
+    async def reload(self) -> bool:
+        """Re-read the mocks file. On errors keep serving the last good config."""
+        from .validate import has_errors, validate_file
+
+        path = self.config.source_path
+        if not path:
+            return False
+        problems = validate_file(path)
+        if has_errors(problems):
+            self.reload_errors = [str(p) for p in problems if p.level == "error"]
+            logger.error(
+                "reload of %s rejected, still serving the previous version:\n  %s",
+                path, "\n  ".join(self.reload_errors),
+            )
+            return False
+        try:
+            new_config = load_config(path)
+        except Exception as exc:  # noqa: BLE001 - keep serving on any load failure
+            self.reload_errors = [f"error    {type(exc).__name__}: {exc}"]
+            logger.error("reload of %s failed, still serving the previous version: %s", path, exc)
+            return False
+        new_config.apply_overrides(self.config.overrides)
+        await self._swap_config(new_config)
+        self.reload_errors = []
+        self.reload_count += 1
+        # Body files may have been added or removed: track the new set.
+        self._watch_snapshot = self._snapshot()
+        logger.info(
+            "reloaded %s: %d routes, %d resources (kept data for: %s)",
+            path, len(new_config.routes), len(new_config.resources),
+            ", ".join(self.resources.kept) or "none",
+        )
+        return True
+
+    async def _swap_config(self, new: MockConfig) -> None:
+        old_recorder = self.recorder
+        if new.seed != self.config.seed:
+            self.engine = TemplateEngine(seed=new.seed)
+            self.behavior = BehaviorEngine(seed=new.seed)
+        matcher = Matcher(new.routes)
+        resources = ResourceRouter(new.resources, previous=self.resources)
+        recorder = old_recorder
+        if new.record != self.config.record:
+            recorder = (
+                build_recorder(new.record, new.base_dir, transport=self._upstream_transport)
+                if new.record else None
+            )
+        old_scripts = {r.key: repr(r.all_responses()) for r in self.config.routes}
+        new_scripts = {r.key: repr(r.all_responses()) for r in new.routes}
+        cursors = {k: v for k, v in self.cursors.items() if old_scripts.get(k) == new_scripts.get(k)}
+        journal = self.journal
+        if new.journal_size != journal.size:
+            journal = Journal(new.journal_size)
+        # Swap everything in one synchronous step so no request sees a mix.
+        self.config, self.matcher, self.resources, self.recorder = new, matcher, resources, recorder
+        self.cursors, self.journal = cursors, journal
+        if old_recorder is not None and old_recorder is not recorder:
+            await old_recorder.aclose()
 
     # -- request context -------------------------------------------------- #
     async def _build_info(self, request: Request) -> Dict[str, Any]:
         body = await request.body()
         parsed: Any = None
+        json_valid = False
         if body:
             try:
                 parsed = json.loads(body)
+                json_valid = True
             except (ValueError, UnicodeDecodeError):
                 parsed = None
         return {
             "method": request.method,
             "path": request.url.path,
             "query": dict(request.query_params),
+            "query_items": list(request.query_params.multi_items()),
             "headers": {k.lower(): v for k, v in request.headers.items()},
             "json": parsed,
+            "json_valid": json_valid,
             "body": body,
         }
 
@@ -168,17 +347,48 @@ class MockServer:
         ctx = self._render_ctx(info, params)
         latency = route.latency if route.latency is not None else self.config.global_latency
         chaos = route.chaos if route.chaos is not None else self.config.global_chaos
-        gate = await self._behavior_gate(f"{route.method}:{route.path}", latency, chaos, ctx)
+        gate = await self._behavior_gate(route.key, latency, chaos, ctx)
         if gate is not None:
-            return gate
+            return self._tag_route(gate, route)
 
-        body = self._resolve_body(route.response, ctx)
-        headers = {k: str(self.engine.render(v, ctx)) for k, v in route.response.headers.items()}
+        response = self._next_response(route)
+        headers = {k: _header_str(self.engine.render(v, ctx)) for k, v in response.headers.items()}
+        status = self._resolve_status(response, ctx)
+        body = self._resolve_body(response, ctx, headers)
         if info["method"] == "HEAD":
             body = None
-        return self._make_response(route.response.status, body, headers)
+        return self._tag_route(self._make_response(status, body, headers), route)
 
-    def _resolve_body(self, response: ResponseSpec, ctx: Dict[str, Any]) -> Any:
+    def _next_response(self, route: RouteSpec) -> ResponseSpec:
+        """Pick the response for this call (advances ``responses:`` scripts)."""
+        responses = route.all_responses()
+        if len(responses) == 1:
+            return responses[0]
+        index = self.cursors.get(route.key, 0)
+        self.cursors[route.key] = index + 1
+        if route.sequence == "cycle":
+            return responses[index % len(responses)]
+        return responses[min(index, len(responses) - 1)]
+
+    @staticmethod
+    def _tag_route(response: Response, route: RouteSpec) -> Response:
+        if route.name:
+            response.headers["x-matched-route"] = route.name
+        return response
+
+    def _resolve_status(self, response: ResponseSpec, ctx: Dict[str, Any]) -> int:
+        raw = response.status
+        if isinstance(raw, str):
+            raw = self.engine.render(raw, ctx)
+        try:
+            status = int(raw)
+        except (TypeError, ValueError):
+            raise TemplateError(f"status rendered to {raw!r}, not an integer") from None
+        if not 100 <= status <= 599:
+            raise TemplateError(f"status {status} is outside 100-599")
+        return status
+
+    def _resolve_body(self, response: ResponseSpec, ctx: Dict[str, Any], headers: Dict[str, str]) -> Any:
         if response.file:
             path = response.file
             if not os.path.isabs(path):
@@ -186,15 +396,68 @@ class MockServer:
             with open(path, "r", encoding="utf-8") as fh:
                 raw = fh.read()
             if response.file.endswith(".json"):
-                return self.engine.render(json.loads(raw), ctx)
+                rendered = self.engine.render(json.loads(raw), ctx)
+                return JSON_NULL if rendered is None else rendered
+            # Non-JSON files are sent as text, exactly as rendered.
             return self.engine.render(raw, ctx)
         if response.body is None:
             return None
-        return self.engine.render(response.body, ctx)
+        rendered = self.engine.render(response.body, ctx)
+        if rendered is None:
+            return JSON_NULL
+        if isinstance(rendered, str):
+            declared = next((v for k, v in headers.items() if k.lower() == "content-type"), None)
+            if _is_json_type(declared):
+                return self._json_text(rendered)
+        return rendered
+
+    @staticmethod
+    def _json_text(text: str) -> Any:
+        """A string body declared as JSON: pass JSON documents through, encode the rest."""
+        stripped = text.strip()
+        if stripped[:1] in ("{", "["):
+            try:
+                json.loads(stripped)
+                return text.encode("utf-8")
+            except ValueError:
+                pass
+        return _JsonScalar(text)
 
     # -- resources -------------------------------------------------------- #
+    def _object_body(self, spec: ResourceSpec, info: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Response]]:
+        """The JSON object sent to a resource, or a 400 explaining why not."""
+        if not info.get("body"):
+            return {}, None
+        if not info.get("json_valid"):
+            return None, self._make_response(
+                400,
+                {"error": "invalid_json", "resource": spec.name,
+                 "message": "The request body is not valid JSON."},
+                {},
+            )
+        payload = info.get("json")
+        if not isinstance(payload, dict):
+            kind = "null" if payload is None else type(payload).__name__
+            kind = {"list": "array", "str": "string", "int": "number", "float": "number", "bool": "boolean"}.get(kind, kind)
+            return None, self._make_response(
+                400,
+                {"error": "invalid_body", "resource": spec.name,
+                 "message": f"Expected a JSON object, got {kind}."},
+                {},
+            )
+        return payload, None
+
     async def _serve_resource(self, op: Dict[str, Any], info: Dict[str, Any]) -> Response:
         spec: ResourceSpec = op["spec"]
+        kind = op["kind"]
+
+        if kind == "options":
+            return self._make_response(204, None, {"allow": op["allow"]})
+        if kind == "method_not_allowed":
+            return self._make_response(
+                405, {"error": "method_not_allowed", "allow": op["allow"]}, {"allow": op["allow"]}
+            )
+
         ctx = self._render_ctx(info, {})
         latency = spec.latency if spec.latency is not None else self.config.global_latency
         chaos = spec.chaos if spec.chaos is not None else self.config.global_chaos
@@ -203,12 +466,7 @@ class MockServer:
             return gate
 
         store = self.resources.store_for(spec)
-        kind = op["kind"]
 
-        if kind == "method_not_allowed":
-            return self._make_response(
-                405, {"error": "method_not_allowed", "allow": op["allow"]}, {"allow": op["allow"]}
-            )
         if kind == "list":
             items, total = store.list(info["query"])
             body = None if info["method"] == "HEAD" else items
@@ -218,17 +476,33 @@ class MockServer:
             if item is None:
                 return self._not_found_item(spec, op["id"])
             return self._make_response(200, None if info["method"] == "HEAD" else item, {})
+
+        payload: Dict[str, Any] = {}
+        if kind in ("create", "replace", "update"):
+            parsed, error = self._object_body(spec, info)
+            if error is not None:
+                return error
+            payload = parsed or {}
+
         if kind == "create":
-            item = store.create(info.get("json") or {})
+            try:
+                item = store.create(payload)
+            except ResourceConflict as exc:
+                return self._make_response(
+                    409,
+                    {"error": "conflict", "resource": spec.name, "id": exc.item_id,
+                     "message": f"{spec.name} {exc.item_id!r} already exists; use PUT or PATCH to change it."},
+                    {},
+                )
             location = f"{spec.path.rstrip('/')}/{item[spec.id_field]}"
             return self._make_response(201, item, {"location": location})
         if kind == "replace":
-            item = store.replace(op["id"], info.get("json") or {})
+            item = store.replace(op["id"], payload)
             if item is None:
                 return self._not_found_item(spec, op["id"])
             return self._make_response(200, item, {})
         if kind == "update":
-            item = store.update(op["id"], info.get("json") or {})
+            item = store.update(op["id"], payload)
             if item is None:
                 return self._not_found_item(spec, op["id"])
             return self._make_response(200, item, {})
@@ -248,27 +522,76 @@ class MockServer:
 
     # -- responses -------------------------------------------------------- #
     def _make_response(self, status: int, body: Any, headers: Dict[str, str]) -> Response:
-        out = {k.lower(): str(v) for k, v in (headers or {}).items()}
-        if self.config.cors:
-            for k, v in _CORS_HEADERS.items():
-                out.setdefault(k, v)
-        if body is None:
+        out = {k.lower(): _header_str(v) for k, v in (headers or {}).items()}
+        if body is None or status in (204, 304):
             content = b""
-        elif isinstance(body, (dict, list)):
-            out.setdefault("content-type", "application/json")
-            content = json.dumps(body, ensure_ascii=False).encode("utf-8")
         elif isinstance(body, (bytes, bytearray)):
             content = bytes(body)
-        else:
+        elif isinstance(body, _JsonScalar):
+            out.setdefault("content-type", "application/json")
+            content = json.dumps(body.value, ensure_ascii=False).encode("utf-8")
+        elif body is JSON_NULL:
+            out.setdefault("content-type", "application/json")
+            content = b"null"
+        elif isinstance(body, str):
             out.setdefault("content-type", "text/plain; charset=utf-8")
-            content = str(body).encode("utf-8")
+            content = body.encode("utf-8")
+        else:
+            # dict, list, bool, int, float: all JSON.
+            out.setdefault("content-type", "application/json")
+            content = json.dumps(body, ensure_ascii=False).encode("utf-8")
         return Response(content=content, status_code=status, headers=out)
 
-    def _cors_preflight(self) -> Response:
-        return self._make_response(204, None, {})
+    def _apply_cors(self, response: Response, info: Dict[str, Any]) -> Response:
+        """Add CORS headers that work for credentialed and plain requests."""
+        origin = info["headers"].get("origin")
+        headers = response.headers
+        if origin:
+            headers.setdefault("access-control-allow-origin", origin)
+            headers.setdefault("access-control-allow-credentials", "true")
+            vary = headers.get("vary")
+            if not vary:
+                headers["vary"] = "Origin"
+            elif "origin" not in vary.lower():
+                headers["vary"] = vary + ", Origin"
+        else:
+            headers.setdefault("access-control-allow-origin", "*")
+        exposed = sorted(
+            k for k in headers.keys()
+            if k not in _CORS_SAFELISTED and not k.startswith("access-control-") and k != "vary"
+        )
+        if exposed:
+            headers.setdefault("access-control-expose-headers", ", ".join(exposed))
+        return response
+
+    def _cors_preflight(self, info: Dict[str, Any]) -> Response:
+        requested_method = info["headers"].get("access-control-request-method", "")
+        methods = _ALLOW_METHODS
+        if requested_method and requested_method.upper() not in methods:
+            methods = f"{methods}, {requested_method.upper()}"
+        headers = {
+            "access-control-allow-methods": methods,
+            "access-control-allow-headers": info["headers"].get("access-control-request-headers") or "*",
+            "access-control-max-age": "600",
+            "vary": "Origin, Access-Control-Request-Method, Access-Control-Request-Headers",
+        }
+        return self._make_response(204, None, headers)
+
+    @staticmethod
+    def _is_preflight(info: Dict[str, Any]) -> bool:
+        headers = info["headers"]
+        return (
+            info["method"] == "OPTIONS"
+            and "origin" in headers
+            and "access-control-request-method" in headers
+        )
 
     def _index(self) -> Response:
-        routes = [{"method": r.method, "path": r.path, "priority": r.priority} for r in self.config.routes]
+        routes = [
+            {"name": r.name, "method": r.method, "path": r.path, "priority": r.priority}
+            for r in self.config.routes
+        ]
+        prefix = self.config.admin_prefix
         resources = [{"name": s.name, "path": s.path} for s in self.config.resources]
         return self._make_response(
             200,
@@ -277,6 +600,14 @@ class MockServer:
                 "routes": routes,
                 "resources": resources,
                 "record": bool(self.recorder),
+                "watch": {
+                    "enabled": self.watch,
+                    "reloads": self.reload_count,
+                    "errors": self.reload_errors,
+                },
+                "journal": {"enabled": self.journal.enabled, "size": self.journal.size,
+                            "entries": len(self.journal)},
+                "admin": [e.format(p=prefix) for e in ADMIN_ENDPOINTS],
             },
             {},
         )
@@ -288,42 +619,215 @@ class MockServer:
                 "error": "no_mock_matched",
                 "method": info["method"],
                 "path": info["path"],
-                "hint": "No explicit route, resource or fixture matched this request.",
+                "hint": "No explicit route, resource or fixture matched this request. "
+                        f"GET {self.config.admin_prefix} lists what is configured.",
                 "configured_routes": len(self.config.routes),
                 "configured_resources": len(self.config.resources),
             },
             {},
         )
 
-    # -- dispatch --------------------------------------------------------- #
-    async def dispatch(self, request: Request) -> Response:
-        info = await self._build_info(request)
+    # -- admin API -------------------------------------------------------- #
+    def _is_admin(self, path: str) -> bool:
+        prefix = self.config.admin_prefix
+        return path == prefix or path.startswith(prefix + "/")
 
-        hit = self.matcher.match(info["method"], info["path"], info)
+    def _admin(self, info: Dict[str, Any]) -> Response:
+        prefix = self.config.admin_prefix
+        sub = info["path"][len(prefix):].strip("/")
+        method = info["method"]
+        if sub == "":
+            if method in ("GET", "HEAD"):
+                return self._index()
+            return self._admin_405("GET")
+        if sub == "routes":
+            if method in ("GET", "HEAD"):
+                return self._make_response(200, self._routes_listing(), {})
+            return self._admin_405("GET")
+        if sub == "requests":
+            if method in ("GET", "HEAD"):
+                entries = self.journal.query(info["query"])
+                return self._make_response(200, {"count": len(entries), "requests": entries}, {})
+            if method == "DELETE":
+                cleared = self.journal.clear()
+                return self._make_response(200, {"cleared": cleared}, {})
+            return self._admin_405("GET, DELETE")
+        if sub == "reset":
+            if method == "POST":
+                return self._make_response(200, self.reset(), {})
+            return self._admin_405("POST")
+        return self._make_response(
+            404,
+            {"error": "unknown_admin_endpoint", "path": info["path"],
+             "endpoints": [e.format(p=prefix) for e in ADMIN_ENDPOINTS]},
+            {},
+        )
+
+    def _admin_405(self, allow: str) -> Response:
+        return self._make_response(405, {"error": "method_not_allowed", "allow": allow}, {"allow": allow})
+
+    def _routes_listing(self) -> Dict[str, Any]:
+        routes = []
+        for route in self.matcher.routes:  # in match order
+            entry: Dict[str, Any] = {
+                "name": route.name,
+                "method": route.method,
+                "path": route.path,
+                "priority": route.priority,
+                "match": route.match or None,
+                "hits": self.hits.get(route.key, 0),
+            }
+            responses = route.all_responses()
+            if len(responses) > 1:
+                entry["responses"] = len(responses)
+                entry["sequence"] = route.sequence
+                entry["next_response"] = self._peek_index(route)
+            routes.append(entry)
+        resources = [
+            {"name": spec.name, "path": spec.path, "items": len(self.resources.store_for(spec))}
+            for spec in self.config.resources
+        ]
+        return {"routes": routes, "resources": resources}
+
+    def _peek_index(self, route: RouteSpec) -> int:
+        index = self.cursors.get(route.key, 0)
+        n = len(route.all_responses())
+        return index % n if route.sequence == "cycle" else min(index, n - 1)
+
+    def reset(self) -> Dict[str, Any]:
+        """Rewind all runtime state to how the server started."""
+        resources = self.resources.reset()
+        self.engine.reset()
+        self.behavior.reset()
+        self.cursors.clear()
+        self.hits.clear()
+        cleared = self.journal.clear()
+        return {
+            "reset": True,
+            "resources": resources,
+            "journal_cleared": cleared,
+            "also_reset": ["sequences", "faker rng", "chaos rng", "rate limits",
+                           "response sequences", "route hit counts"],
+        }
+
+    # -- dispatch --------------------------------------------------------- #
+    async def _route_request(self, info: Dict[str, Any], trace: Dict[str, Any]) -> Response:
+        method, path = info["method"], info["path"]
+
+        if self.config.cors and self._is_preflight(info):
+            # A route declared with `method: OPTIONS` still wins over the
+            # automatic preflight answer; ANY/* routes do not.
+            hit = self.matcher.match(method, path, info, explicit_only=True)
+            if hit is not None:
+                route, params = hit
+                trace["matched"] = {"type": "route", "name": route.label}
+                self.hits[route.key] += 1
+                return await self._serve_route(route, info, params)
+            trace["matched"] = {"type": "preflight"}
+            return self._cors_preflight(info)
+
+        if self._is_admin(path):
+            trace["admin"] = True
+            return self._admin(info)
+
+        hit = self.matcher.match(method, path, info)
         if hit is not None:
             route, params = hit
+            trace["matched"] = {"type": "route", "name": route.label}
+            self.hits[route.key] += 1
             return await self._serve_route(route, info, params)
 
-        op = self.resources.match(info["method"], info["path"])
+        op = self.resources.match(method, path)
         if op is not None:
+            trace["matched"] = {"type": "resource", "name": op["spec"].name, "operation": op["kind"]}
             return await self._serve_resource(op, info)
 
-        if info["method"] == "OPTIONS" and self.config.cors:
-            return self._cors_preflight()
+        if method == "OPTIONS" and self.config.cors:
+            trace["matched"] = {"type": "preflight"}
+            return self._cors_preflight(info)
 
         if self.recorder is not None:
-            status, body, headers = await self.recorder.handle(info)
+            trace["matched"] = {"type": "fixture", "name": self.recorder.key_for(info)}
+            try:
+                status, body, headers = await self.recorder.handle(info)
+            except httpx.HTTPError as exc:
+                return self._make_response(
+                    502,
+                    {"error": "upstream_error", "upstream": self.recorder.upstream,
+                     "detail": f"{type(exc).__name__}: {exc}"},
+                    {"x-mock-source": "upstream-error"},
+                )
             return self._make_response(status, body, headers)
 
-        if info["method"] in ("GET", "HEAD") and info["path"] in ("/", "/__mock__"):
+        if method in ("GET", "HEAD") and path == "/":
+            trace["matched"] = {"type": "index"}
             return self._index()
 
+        trace["matched"] = None
         return self._not_found(info)
 
+    def _error_response(self, exc: Exception, trace: Dict[str, Any], info: Dict[str, Any]) -> Response:
+        matched = trace.get("matched") or {}
+        label = matched.get("name") or f"{info['method']} {info['path']}"
+        body: Dict[str, Any] = {
+            "error": "mock_error",
+            "route": label,
+            "detail": str(exc) or type(exc).__name__,
+            "type": type(exc).__name__,
+        }
+        if isinstance(exc, TemplateError) and exc.expression:
+            body["expression"] = exc.expression
+        logger.error("mock_error while serving %s: %s", label, body["detail"])
+        return self._make_response(500, body, {})
 
-def create_app(config: MockConfig) -> Starlette:
-    """Build a Starlette ASGI app that serves the given mock configuration."""
-    server = MockServer(config)
+    async def dispatch(self, request: Request) -> Response:
+        started = time.perf_counter()
+        await self.maybe_reload()
+        info = await self._build_info(request)
+        trace: Dict[str, Any] = {}
+        try:
+            response = await self._route_request(info, trace)
+        except Exception as exc:  # noqa: BLE001 - a mock must explain its own failures
+            response = self._error_response(exc, trace, info)
+        if self.config.cors:
+            self._apply_cors(response, info)
+        if not trace.get("admin"):
+            self.journal.record(
+                info, response.status_code, trace.get("matched"), (time.perf_counter() - started) * 1000
+            )
+        return response
+
+
+class _JsonScalar:
+    """A string that must be sent JSON-encoded (``"text"``), not as text/plain."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+def create_app(
+    config: MockConfig,
+    *,
+    upstream_transport: Optional[httpx.AsyncBaseTransport] = None,
+    watch: bool = False,
+    watch_interval: float = 0.5,
+) -> Starlette:
+    """Build a Starlette ASGI app that serves the given mock configuration.
+
+    ``upstream_transport`` lets tests (or embedders) plug an httpx transport
+    such as ``httpx.MockTransport`` into record mode instead of the network.
+
+    ``watch=True`` (config must come from :func:`load_config`) re-reads the
+    mocks file and its body files when they change, checked at most every
+    ``watch_interval`` seconds on incoming requests. Resource data survives a
+    reload unless that resource's definition changed; an invalid edit is
+    rejected and the last good config keeps serving.
+    """
+    server = MockServer(
+        config, upstream_transport=upstream_transport, watch=watch, watch_interval=watch_interval
+    )
 
     async def catch_all(request: Request) -> Response:
         return await server.dispatch(request)

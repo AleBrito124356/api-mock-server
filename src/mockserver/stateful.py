@@ -15,10 +15,14 @@ and you get the full REST surface for free, backed by a dict:
     GET    /todos            list  (supports ?field=value, _limit, _offset,
                                     _sort, _order, _page, _per_page)
     GET    /todos/{id}       one   (404 if missing)
-    POST   /todos            create (auto-assigns the id, returns 201)
+    POST   /todos            create (auto-assigns the id, returns 201 +
+                                    Location; 409 if the body reuses an id)
     PUT    /todos/{id}       replace (404 if missing)
     PATCH  /todos/{id}       partial update (404 if missing)
     DELETE /todos/{id}       delete (204, or 404 if missing)
+    OPTIONS                  204 with an Allow header
+
+Write bodies must be JSON objects; anything else is a 400, never a crash.
 
 State lives in the process and resets on restart. Perfect for prototyping a
 frontend against a backend that does not exist yet.
@@ -34,6 +38,17 @@ from .config import ResourceSpec, compile_path
 
 # Query params that control listing rather than filter fields.
 _CONTROL = {"_limit", "_offset", "_sort", "_order", "_page", "_per_page", "_q"}
+
+_COLLECTION_ALLOW = "GET, HEAD, POST, OPTIONS"
+_ITEM_ALLOW = "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"
+
+
+class ResourceConflict(Exception):
+    """A create tried to reuse an id that already exists."""
+
+    def __init__(self, item_id: Any) -> None:
+        super().__init__(f"id {item_id!r} already exists")
+        self.item_id = item_id
 
 
 class ResourceStore:
@@ -120,10 +135,13 @@ class ResourceStore:
         return self._items.get(self._key(raw_id))
 
     def create(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Insert a new item. Raises :class:`ResourceConflict` on a duplicate id."""
         item = dict(data or {})
         if self.id_field not in item or item[self.id_field] in (None, ""):
             item[self.id_field] = self._next_id()
         else:
+            if self._key(item[self.id_field]) in self._items:
+                raise ResourceConflict(item[self.id_field])
             # Honor a client-supplied numeric id but keep the counter ahead.
             if self.id_type == "int":
                 try:
@@ -155,6 +173,9 @@ class ResourceStore:
 
     def delete(self, raw_id: Any) -> bool:
         return self._items.pop(self._key(raw_id), None) is not None
+
+    def __len__(self) -> int:
+        return len(self._items)
 
 
 def _field_equals(field_value: Any, query_value: Any) -> bool:
@@ -191,14 +212,30 @@ def _sort_key(value: Any) -> Tuple[int, Any]:
     return (1, str(value))
 
 
-class ResourceRouter:
-    """Maps an incoming method+path to a resource operation."""
+def _data_identity(spec: ResourceSpec) -> Tuple[Any, ...]:
+    """What defines a store's data (latency/chaos changes keep the data)."""
+    return (spec.name, spec.path, spec.id_field, spec.id_type, repr(spec.seed))
 
-    def __init__(self, specs: List[ResourceSpec]) -> None:
+
+class ResourceRouter:
+    """Maps an incoming method+path to a resource operation.
+
+    Pass ``previous`` (the router being replaced on a hot reload) to keep the
+    in-memory data of every resource whose definition did not change.
+    """
+
+    def __init__(self, specs: List[ResourceSpec], previous: Optional["ResourceRouter"] = None) -> None:
         self.stores: Dict[str, ResourceStore] = {}
         self._entries: List[Tuple[ResourceSpec, "re.Pattern[str]", "re.Pattern[str]"]] = []
+        self.kept: List[str] = []
         for spec in specs:
-            self.stores[spec.name] = ResourceStore(spec)
+            old = previous.stores.get(spec.name) if previous is not None else None
+            if old is not None and _data_identity(old.spec) == _data_identity(spec):
+                old.spec = spec
+                self.stores[spec.name] = old
+                self.kept.append(spec.name)
+            else:
+                self.stores[spec.name] = ResourceStore(spec)
             coll_re, _ = compile_path(spec.path)
             item_re, _ = compile_path(spec.path.rstrip("/") + "/{__rid__}")
             self._entries.append((spec, coll_re, item_re))
@@ -211,7 +248,9 @@ class ResourceRouter:
                     return {"spec": spec, "kind": "list"}
                 if method == "POST":
                     return {"spec": spec, "kind": "create"}
-                return {"spec": spec, "kind": "method_not_allowed", "allow": "GET, POST"}
+                if method == "OPTIONS":
+                    return {"spec": spec, "kind": "options", "allow": _COLLECTION_ALLOW}
+                return {"spec": spec, "kind": "method_not_allowed", "allow": _COLLECTION_ALLOW}
             m = item_re.match(path)
             if m:
                 raw_id = m.group("__rid__")
@@ -225,8 +264,16 @@ class ResourceRouter:
                     return {"spec": spec, "kind": "update", "id": item_id}
                 if method == "DELETE":
                     return {"spec": spec, "kind": "delete", "id": item_id}
-                return {"spec": spec, "kind": "method_not_allowed", "allow": "GET, PUT, PATCH, DELETE"}
+                if method == "OPTIONS":
+                    return {"spec": spec, "kind": "options", "allow": _ITEM_ALLOW}
+                return {"spec": spec, "kind": "method_not_allowed", "allow": _ITEM_ALLOW}
         return None
 
     def store_for(self, spec: ResourceSpec) -> ResourceStore:
         return self.stores[spec.name]
+
+    def reset(self) -> List[str]:
+        """Put every resource back to its seed data. Returns the names."""
+        for name, store in list(self.stores.items()):
+            self.stores[name] = ResourceStore(store.spec)
+        return list(self.stores)

@@ -15,9 +15,12 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Pattern, Tuple
+from typing import Any, Dict, List, Optional, Pattern, Tuple, Union
 
 import yaml
+
+DEFAULT_ADMIN_PREFIX = "/__mock__"
+DEFAULT_JOURNAL_SIZE = 500
 
 # {param} style path segments -> named regex groups.
 _PARAM = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -49,9 +52,13 @@ def compile_path(path: str) -> Tuple[Pattern[str], List[str]]:
 
 @dataclass
 class ResponseSpec:
-    """A single response template for an explicit route."""
+    """A single response template for an explicit route.
 
-    status: int = 200
+    ``status`` is normally an int, but may be a template string such as
+    ``"{{ request.query.status | default(200) }}"`` rendered per request.
+    """
+
+    status: Union[int, str] = 200
     headers: Dict[str, Any] = field(default_factory=dict)
     body: Any = None
     file: Optional[str] = None
@@ -59,7 +66,13 @@ class ResponseSpec:
 
 @dataclass
 class RouteSpec:
-    """An explicit endpoint: method + path + optional matchers + response."""
+    """An explicit endpoint: method + path + optional matchers + response.
+
+    A route either has one ``response`` or a scripted list of ``responses``
+    served in order on consecutive calls. ``sequence`` decides what happens
+    after the last one: ``stick`` (default) keeps returning it, ``cycle``
+    starts over. ``response`` is always the first entry.
+    """
 
     method: str
     path: str
@@ -71,6 +84,23 @@ class RouteSpec:
     regex: Pattern[str]
     param_names: List[str]
     order: int = 0
+    name: Optional[str] = None
+    description: Optional[str] = None
+    responses: List[ResponseSpec] = field(default_factory=list)
+    sequence: str = "stick"
+
+    def all_responses(self) -> List[ResponseSpec]:
+        return list(self.responses) if self.responses else [self.response]
+
+    @property
+    def label(self) -> str:
+        """Human-readable identity: the name, or ``METHOD /path``."""
+        return self.name or f"{self.method} {self.path}"
+
+    @property
+    def key(self) -> str:
+        """Stable identity for per-route state (rate-limit buckets, cursors)."""
+        return self.name or f"{self.method} {self.path} #{self.order}"
 
 
 @dataclass
@@ -95,6 +125,39 @@ class MockConfig:
     resources: List[ResourceSpec] = field(default_factory=list)
     record: Optional[Dict[str, Any]] = None
     base_dir: str = "."
+    source_path: Optional[str] = None
+    # Values set from outside the file (CLI --seed / --fixtures). They are
+    # re-applied when --watch reloads the file so a reload never drops them.
+    overrides: Dict[str, Any] = field(default_factory=dict)
+
+    def set_seed(self, seed: Optional[int]) -> None:
+        """Override the file's seed (kept across hot reloads)."""
+        if seed is not None:
+            self.settings["seed"] = seed
+            self.overrides["seed"] = seed
+
+    def set_record(self, record: Optional[Dict[str, Any]]) -> None:
+        """Override the file's record block (kept across hot reloads)."""
+        self.record = record
+        self.overrides["record"] = record
+
+    def apply_overrides(self, overrides: Dict[str, Any]) -> None:
+        if "seed" in overrides:
+            self.set_seed(overrides["seed"])
+        if "record" in overrides:
+            self.set_record(overrides["record"])
+
+    def body_files(self) -> List[str]:
+        """Absolute paths of every ``response.file`` the routes reference."""
+        out: List[str] = []
+        for route in self.routes:
+            for response in route.all_responses():
+                if response.file:
+                    path = response.file
+                    if not os.path.isabs(path):
+                        path = os.path.join(self.base_dir, path)
+                    out.append(os.path.abspath(path))
+        return out
 
     @property
     def seed(self) -> Optional[int]:
@@ -112,19 +175,26 @@ class MockConfig:
     def global_chaos(self) -> Optional[Dict[str, Any]]:
         return self.settings.get("chaos")
 
+    @property
+    def admin_prefix(self) -> str:
+        """Where the admin API lives (journal, reset, routes)."""
+        prefix = str(self.settings.get("admin_prefix") or DEFAULT_ADMIN_PREFIX)
+        return "/" + prefix.strip("/")
+
+    @property
+    def journal_size(self) -> int:
+        """How many recent requests the journal keeps (0 turns it off)."""
+        return int(self.settings.get("journal_size", DEFAULT_JOURNAL_SIZE))
+
 
 def _build_route(raw: Dict[str, Any], order: int) -> RouteSpec:
     method = str(raw.get("method", "GET")).upper()
     path = str(raw.get("path", "/"))
     regex, names = compile_path(path)
 
-    resp_raw = raw.get("response") or {}
-    response = ResponseSpec(
-        status=int(resp_raw.get("status", 200)),
-        headers=dict(resp_raw.get("headers") or {}),
-        body=resp_raw.get("body"),
-        file=resp_raw.get("file"),
-    )
+    responses = [_build_response(r or {}) for r in raw.get("responses") or []]
+    response = responses[0] if responses else _build_response(raw.get("response") or {})
+    name = raw.get("name")
     return RouteSpec(
         method=method,
         path=path,
@@ -136,6 +206,22 @@ def _build_route(raw: Dict[str, Any], order: int) -> RouteSpec:
         regex=regex,
         param_names=names,
         order=order,
+        name=str(name) if name is not None else None,
+        description=raw.get("description"),
+        responses=responses,
+        sequence=str(raw.get("sequence", "stick")).lower(),
+    )
+
+
+def _build_response(resp_raw: Dict[str, Any]) -> ResponseSpec:
+    status: Union[int, str] = resp_raw.get("status", 200)
+    if not (isinstance(status, str) and "{{" in status):
+        status = int(status)
+    return ResponseSpec(
+        status=status,
+        headers=dict(resp_raw.get("headers") or {}),
+        body=resp_raw.get("body"),
+        file=resp_raw.get("file"),
     )
 
 
@@ -167,9 +253,22 @@ def build_config(data: Optional[Dict[str, Any]], base_dir: str = ".") -> MockCon
     )
 
 
-def load_config(path: str) -> MockConfig:
-    """Load and parse a mocks YAML file from disk."""
+def load_config(path: str, strict: bool = False) -> MockConfig:
+    """Load and parse a mocks YAML file from disk.
+
+    With ``strict=True`` the file is validated first (see
+    :mod:`mockserver.validate`) and :class:`~mockserver.validate.ConfigError`
+    is raised if there are errors, instead of building a subtly wrong mock.
+    """
+    if strict:
+        from .validate import ConfigError, has_errors, validate_file
+
+        problems = validate_file(path)
+        if has_errors(problems):
+            raise ConfigError(path, problems)
     with open(path, "r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh)
     base_dir = os.path.dirname(os.path.abspath(path))
-    return build_config(data, base_dir=base_dir)
+    config = build_config(data, base_dir=base_dir)
+    config.source_path = os.path.abspath(path)
+    return config

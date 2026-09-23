@@ -16,10 +16,11 @@ env/
 .coverage
 htmlcov/
 
-# Recorded fixtures and generated configs (keep the examples)
+# Recorded fixtures and generated configs at the repo root only.
+# (examples/**/mocks.yaml are part of the project and must stay tracked.)
 /fixtures/
-*.mocks.yaml
-mocks.yaml
+/*.mocks.yaml
+/mocks.yaml
 
 # Editors / OS
 .vscode/
