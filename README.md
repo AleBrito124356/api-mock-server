@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![Starlette](https://img.shields.io/badge/ASGI-Starlette-ff69b4)
-![Tests](https://img.shields.io/badge/tests-38%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-104%20passing-brightgreen)
 
 ---
 
@@ -55,17 +55,31 @@ Routes are ordered by `priority` descending, then by declaration order, and the 
 ```bash
 git clone https://github.com/AleBrito124356/api-mock-server
 cd api-mock-server
-pip install -r requirements.txt        # or: pip install -e .
-
-# Optional: defaults so you can skip repeating flags.
-cp .env.example .env
+pip install -e .                       # or: pip install -r requirements.txt
 
 # Serve one of the bundled examples.
-python cli.py serve --config examples/shop-api/mocks.yaml
-# -> api-mock-server serving ... on http://127.0.0.1:8000
+mockserver serve --config examples/shop-api/mocks.yaml
+# -> api-mock-server serving examples/shop-api/mocks.yaml on http://127.0.0.1:8000
 ```
 
-Installing the package (`pip install -e .`) also gives you a `mockserver` command, so `mockserver serve ...` works from anywhere.
+Without installing the package, `python cli.py ...` runs the same CLI straight
+from the checkout (`python cli.py serve --config examples/shop-api/mocks.yaml`).
+
+`mockserver --version` prints the installed version.
+
+### Defaults from `.env`
+
+Every `serve` / `replay` / `record` flag has an environment default, so you can
+drop the flags you repeat:
+
+```bash
+cp .env.example .env      # MOCK_CONFIG, MOCK_HOST, MOCK_PORT, MOCK_SEED, MOCK_UPSTREAM, MOCK_FIXTURES
+mockserver serve          # now serves MOCK_CONFIG on MOCK_HOST:MOCK_PORT
+```
+
+Precedence, highest first: command-line flag, real environment variable,
+`.env` in the current directory (or `--env-file PATH`), built-in default. The
+`.env` reader is built in; no extra dependency.
 
 ## Usage
 
@@ -75,33 +89,45 @@ Installing the package (`pip install -e .`) also gives you a `mockserver` comman
 mockserver serve --config examples/shop-api/mocks.yaml --port 8000 --seed 7
 ```
 
+The outputs below are real, from a fresh server with seed 7:
+
 ```bash
 $ curl -s localhost:8000/products | jq '.results[0]'
 {
-  "id": 1,
-  "name": "Quartz Orbit",
-  "price": 200.44,
+  "id": 166,
+  "name": "Orbit Meadow",
+  "price": 327.21,
   "in_stock": true,
-  "sku": "cobalt-vector-196"
+  "sku": "vector-signal-474"
 }
 
-# A query-specific route wins over the generic list via priority:
-$ curl -s 'localhost:8000/products?category=books' -D - | grep -i x-matched
+# A query-specific route wins over the generic list via priority. A route's
+# `name` comes back as a header, so you can see which mock answered:
+$ curl -s 'localhost:8000/products?category=books' -D - -o /dev/null | grep -i x-matched
 x-matched-route: products-books
 
 # Path params flow into the body; single-token templates keep their JSON type:
 $ curl -s localhost:8000/products/42 | jq '.id'
 42
 
-# Create endpoints can echo the request body and mint ids:
-$ curl -s -X POST localhost:8000/orders \
-       -H 'content-type: application/json' -d '{"item":"Keyboard","qty":2}' | jq
-{ "id": 1000, "status": "pending", "item": "Keyboard", "qty": 2, ... }
+# Create endpoints can echo the request body and mint ids from a sequence:
+$ curl -s -X POST localhost:8000/orders        -H 'content-type: application/json' -d '{"item":"Keyboard","qty":2}'
+{"id": 1000, "status": "pending", "item": "Keyboard", "qty": 2, "customer": "guest", "created_at": "2026-09-23T11:29:50"}
 
-# Chaos: ~40% of these fail with a 503, seeded so runs are reproducible:
+# Body matching: a zero quantity hits the higher-priority validation route.
+$ curl -s -X POST localhost:8000/orders -H 'content-type: application/json' -d '{"item":"Desk","qty":0}'
+{"error": "validation_failed", "field": "qty", "message": "qty must be at least 1"}
+
+# Chaos: ~40% of these fail with a 503, seeded so every run is identical:
 $ for i in 1 2 3 4 5; do curl -s -o /dev/null -w "%{http_code} " localhost:8000/flaky; done
-503 200 200 503 503
+503 503 200 503 200
 ```
+
+The same file also has a header-matched `/me` (401 without `Authorization`),
+a slow `/recommendations` (150-600 ms), a rate-limited `/search` (the 6th call
+in 10 s is a 429 with `Retry-After`), a file-backed `/health`, and a stateful
+`/customers` collection. `tests/test_examples.py` runs every one of these
+flows, so the examples cannot silently rot again.
 
 ### Stateful CRUD
 
@@ -134,10 +160,21 @@ Response bodies are taken from the spec's response examples, then schema example
 # Proxy everything unmatched to the real API and save responses as fixtures.
 mockserver record --upstream https://api.example.com --fixtures ./fixtures --port 8000
 
-# Later, work offline: point at the same fixtures dir with no upstream and it replays.
+# Later, work offline: replay the same fixtures with no upstream at all.
+mockserver replay --fixtures ./fixtures --port 8000
+
+# Or keep your hand-written mocks in front and fall back to the fixtures.
+mockserver serve --config mocks.yaml --fixtures ./fixtures
 ```
 
-Fixtures are plain JSON on disk, one file per request, so they are easy to inspect, edit, and commit.
+Fixtures are plain JSON on disk, one file per distinct request, so they are
+easy to inspect, edit, and commit. A request is identified by its method, path,
+every query parameter (repeated ones included, order-insensitive) and a hash of
+its body, so two POSTs with different payloads get two fixtures. JSON bodies
+are hashed in canonical form, so key order and whitespace do not matter.
+Fixtures recorded by 0.1.x (no body hash) still replay. A replay miss is a 404
+naming the fixture key it looked for; an unreachable upstream is a 502
+`upstream_error`, not a hang or an opaque 500.
 
 ## mocks.yaml reference
 
@@ -242,7 +279,7 @@ api-mock-server/
 - **[fastapi-production-template](https://github.com/AleBrito124356/fastapi-production-template)** — when the mock has served its purpose, build the real async FastAPI backend from this starter.
 - **[webhook-toolkit](https://github.com/AleBrito124356/webhook-toolkit)** — the same record-and-replay idea for inbound webhooks: verify, inspect, and replay locally.
 - **[nextjs-ai-chat-template](https://github.com/AleBrito124356/nextjs-ai-chat-template)** — a clean Next.js 15 frontend to point at this mock while the backend is still being built.
-- **[python-cli-template](https://github.com/AleBrito124356/python-cli-template)** — the batteries-included pattern for the kind of Typer + Rich CLI this project ships.
+- **[python-cli-template](https://github.com/AleBrito124356/python-cli-template)** — a batteries-included Typer + Rich CLI starter, for when a tool outgrows the plain `argparse` CLI this project deliberately keeps dependency-free.
 
 ## License
 

@@ -8,7 +8,7 @@ Public surface:
 from .config import MockConfig, RouteSpec, ResourceSpec, ResponseSpec, build_config, load_config
 from .server import create_app
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "MockConfig",

@@ -1,0 +1,27 @@
+# Todo API: the smallest useful fake backend.
+#
+#   mockserver serve --config examples/todo-api/mocks.yaml
+#
+# One `resources` block gives you, with no handler code:
+#   GET    /todos             list (?done=false  ?_sort=id&_order=desc
+#                             ?_limit=2&_offset=2  ?_page=2&_per_page=10  ?_q=text)
+#   POST   /todos             create -> 201 + Location, id auto-assigned
+#   GET    /todos/{id}        read one (404 if missing)
+#   PUT    /todos/{id}        replace
+#   PATCH  /todos/{id}        partial update
+#   DELETE /todos/{id}        delete -> 204
+#
+# State lives in memory and resets when the server restarts.
+
+config:
+  cors: true
+
+resources:
+  - name: todos
+    path: /todos
+    id_field: id
+    id_type: int
+    seed:
+      - { id: 1, title: Sketch the UI, done: true }
+      - { id: 2, title: Wire up the API, done: false }
+      - { id: 3, title: Write the e2e tests, done: false }

@@ -1,0 +1,171 @@
+# Shop API: most of what api-mock-server can do, in one file.
+#
+#   mockserver serve --config examples/shop-api/mocks.yaml
+#   curl -s localhost:8000/__mock__          # what is configured
+#
+# Every curl example in the project README runs against this file.
+
+config:
+  seed: 7          # same seed -> same fake data and the same chaos sequence
+  cors: true       # browsers on another origin can call every endpoint
+
+routes:
+  # --- Catalog --------------------------------------------------------------
+
+  # Generic product list. Each item is rendered separately, so the three
+  # results differ from each other and from call to call.
+  - name: products-list
+    method: GET
+    path: /products
+    response:
+      body:
+        page: "{{ request.query.page | default(1) | int }}"
+        per_page: 3
+        results:
+          - &product
+            id: "{{ faker.int(1, 500) }}"
+            name: "{{ faker.words(2) | title }}"
+            price: "{{ faker.price(5, 500) }}"
+            in_stock: "{{ faker.bool }}"
+            sku: "{{ faker.slug }}"
+          - *product
+          - *product
+
+  # Same path, but only for ?category=books. The higher priority makes it win
+  # over the generic list; the name comes back as the X-Matched-Route header.
+  - name: products-books
+    method: GET
+    path: /products
+    priority: 10
+    match:
+      query: { category: books }
+    response:
+      body:
+        category: books
+        results:
+          - { id: 101, name: "Designing Data-Intensive Applications", price: 42.5, in_stock: true, sku: books-ddia-101 }
+          - { id: 102, name: "The Pragmatic Programmer", price: 35.0, in_stock: false, sku: books-prag-102 }
+
+  # Path params flow into the body. `| int` keeps the id a JSON number.
+  - name: product-detail
+    method: GET
+    path: /products/{id}
+    response:
+      body:
+        id: "{{ request.path.id | int }}"
+        name: "{{ faker.words(2) | title }}"
+        description: "{{ faker.sentence }}"
+        price: "{{ faker.price(5, 500) }}"
+        in_stock: "{{ faker.bool }}"
+        vendor: "{{ faker.company }}"
+        updated_at: "{{ now.iso }}"
+
+  # --- Orders ---------------------------------------------------------------
+
+  # Body matching: a zero quantity gets a validation error...
+  - name: create-order-invalid
+    method: POST
+    path: /orders
+    priority: 5
+    match:
+      body: { qty: 0 }
+    response:
+      status: 422
+      body:
+        error: validation_failed
+        field: qty
+        message: qty must be at least 1
+
+  # ...everything else is accepted, echoed back, and gets an id from a
+  # sequence that starts at 1000.
+  - name: create-order
+    method: POST
+    path: /orders
+    response:
+      status: 201
+      body:
+        id: "{{ seq.order(1000) }}"
+        status: pending
+        item: "{{ request.body.item }}"
+        qty: "{{ request.body.qty | default(1) | int }}"
+        customer: "{{ request.body.customer | default('guest') }}"
+        created_at: "{{ now.iso }}"
+
+  # --- Auth -----------------------------------------------------------------
+
+  # Header matching: "*" means "present with any value".
+  - name: me
+    method: GET
+    path: /me
+    match:
+      headers: { Authorization: "*" }
+    response:
+      body:
+        id: 1
+        name: "{{ faker.name }}"
+        email: "{{ faker.email }}"
+        role: admin
+
+  - name: me-unauthorized
+    method: GET
+    path: /me
+    response:
+      status: 401
+      body: { error: unauthorized, message: Send an Authorization header. }
+
+  # --- Bad network on purpose ------------------------------------------------
+
+  # About 40% of calls fail with a 503. The seed makes the sequence repeatable.
+  - name: flaky
+    method: GET
+    path: /flaky
+    chaos:
+      error_rate: 0.4
+      error_status: 503
+      error_body: { error: upstream_unavailable, retry: true }
+    response:
+      body: { ok: true, served_at: "{{ now.iso }}" }
+
+  # A slow endpoint: every call waits 150-600 ms.
+  - name: recommendations
+    method: GET
+    path: /recommendations
+    latency:
+      random_ms: [150, 600]
+    response:
+      body:
+        - { id: "{{ faker.int(1, 500) }}", name: "{{ faker.words(2) | title }}" }
+        - { id: "{{ faker.int(1, 500) }}", name: "{{ faker.words(2) | title }}" }
+
+  # Rate limited: the 6th call inside 10 seconds gets a 429 with Retry-After.
+  - name: search
+    method: GET
+    path: /search
+    chaos:
+      rate_limit: { limit: 5, window_ms: 10000, status: 429 }
+    response:
+      body:
+        query: "{{ request.query.q | default('') }}"
+        results:
+          - "{{ faker.words(2) }}"
+          - "{{ faker.words(2) }}"
+
+  # --- Misc -----------------------------------------------------------------
+
+  # Body loaded from a file next to this one (the file is templated too).
+  - name: health
+    method: GET
+    path: /health
+    response:
+      file: bodies/health.json
+
+resources:
+  # Full CRUD at /customers with filtering, sorting and pagination.
+  - name: customers
+    path: /customers
+    id_field: id
+    id_type: int
+    seed:
+      - { id: 1, name: Ada Brito, email: ada@example.com, tier: gold }
+      - { id: 2, name: Linus Okafor, email: linus@example.com, tier: silver }
+      - { id: 3, name: Grace Chen, email: grace@example.com, tier: gold }
